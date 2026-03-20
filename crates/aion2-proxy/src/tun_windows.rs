@@ -11,6 +11,8 @@ use std::net::Ipv4Addr;
 #[cfg(windows)]
 use std::sync::Arc;
 #[cfg(windows)]
+use std::time::Instant;
+#[cfg(windows)]
 use tokio::sync::mpsc;
 
 #[cfg(windows)]
@@ -57,6 +59,8 @@ struct NatEntry {
 enum NatState {
     SynReceived,
     Established,
+    /// Relay sent Shutdown (game server closed). Waiting for client FIN or timeout.
+    Closing(Instant),
 }
 
 #[cfg(windows)]
@@ -142,6 +146,10 @@ pub async fn run_tun(
         }
     });
 
+    // Periodic cleanup of Closing entries that the client never FIN'd.
+    let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // Main event loop: process TUN packets and relay events
     loop {
         tokio::select! {
@@ -150,6 +158,19 @@ pub async fn run_tun(
             }
             Some(event) = relay_rx.recv() => {
                 handle_relay_event(&state, &nat_table, &tun_write_tx, event).await;
+            }
+            _ = cleanup_interval.tick() => {
+                let mut table = nat_table.lock().await;
+                let now = Instant::now();
+                table.retain(|conn, entry| {
+                    if let NatState::Closing(since) = entry.state {
+                        if now.duration_since(since).as_secs() >= 5 {
+                            tracing::debug!(%conn, "cleaning up stale Closing entry");
+                            return false;
+                        }
+                    }
+                    true
+                });
             }
             else => break,
         }
@@ -250,6 +271,7 @@ async fn handle_tun_packet(
         let mut data_to_send = None;
         let mut fin_ack_pkt = None;
         let mut do_shutdown = false;
+        let mut do_remove = false;
 
         {
             let mut table = nat_table.lock().await;
@@ -258,7 +280,9 @@ async fn handle_tun_packet(
                     entry.state = NatState::Established;
                 }
 
-                if !payload.is_empty() {
+                let is_closing = matches!(entry.state, NatState::Closing(_));
+
+                if !payload.is_empty() && !is_closing {
                     entry.client_next_seq = seq.wrapping_add(payload.len() as u32);
 
                     ack_pkt = Some(build_tcp_packet(
@@ -291,11 +315,13 @@ async fn handle_tun_packet(
                         false,
                     ));
                     entry.our_next_seq = entry.our_next_seq.wrapping_add(1);
-                    do_shutdown = true;
+                    if !is_closing {
+                        do_shutdown = true;
+                    }
+                    do_remove = true;
                 }
             }
-            // Remove entry on FIN — connection is done.
-            if fin {
+            if do_remove {
                 table.remove(&conn);
             }
         } // lock released
@@ -377,7 +403,7 @@ async fn handle_relay_event(
 
         RelayEvent::Shutdown(conn) => {
             let mut table = nat_table.lock().await;
-            if let Some(entry) = table.remove(&conn) {
+            if let Some(entry) = table.get_mut(&conn) {
                 let fin = build_tcp_packet(
                     entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
                     entry.our_next_seq,
@@ -387,9 +413,11 @@ async fn handle_relay_event(
                     &[],
                     false,
                 );
+                entry.our_next_seq = entry.our_next_seq.wrapping_add(1);
+                entry.state = NatState::Closing(Instant::now());
                 drop(table);
                 let _ = tun_write_tx.send(fin).await;
-                tracing::debug!(%conn, "relay shutdown, sent FIN to OS");
+                tracing::debug!(%conn, "relay shutdown, sent FIN to OS (entry→Closing)");
             }
         }
 
