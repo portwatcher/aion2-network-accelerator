@@ -1,0 +1,76 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/schema.json",
+  "productName": "Aion2 Proxy",
+  "version": "0.1.0",
+  "identifier": "com.aion2.proxy",
+  "build": {
+    "frontendDist": "../../ui/dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Aion2 Proxy",
+        "width": 520,
+        "height": 640,
+        "resizable": true,
+        "minWidth": 420,
+        "minHeight": 500,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false,
+      "tooltip": "Aion2 Proxy"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [],
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "",
+      "nsis": {
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "headerImage": null,
+        "sidebarImage": null,
+        "installMode": "currentUser",
+        "languages": ["English", "Japanese"],
+        "startMenuFolder": "Aion2 Proxy"
+      }
+    },
+    "shortDescription": "Game traffic proxy for Aion2 Taiwan",
+    "longDescription": "Routes Aion2 Taiwan game traffic through a Taiwan relay VPS to bypass geo-blocking with minimal latency.",
+    "copyright": "",
+    "category": "Utility",
+    "createUpdaterArtifacts": "v1Compatible"
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    },
+    "updater": {
+      "pubkey": "",
+      "endpoints": [],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

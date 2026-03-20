@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Tauri
+/src-tauri/target/
+dist/
+
+# Node (Tauri frontend)
+node_modules/
+/build/
+
+# Environment
+.env
+*.log
+
+PLAN.md
+TROUBLE.md

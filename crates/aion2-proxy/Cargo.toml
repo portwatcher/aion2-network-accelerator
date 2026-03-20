@@ -1,0 +1,19 @@
+[package]
+name = "aion2-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aion2-common = { path = "../aion2-common" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+wintun = "0.5"
+winapi = { version = "0.3", features = ["iphlpapi", "netioapi", "winsock2"] }
