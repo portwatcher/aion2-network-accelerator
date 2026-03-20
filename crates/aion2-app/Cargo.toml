@@ -20,7 +20,6 @@ anyhow = { workspace = true }
 ssh2 = "0.9"
 sha2 = "0.10"
 rand = { workspace = true }
-openssl = { workspace = true }
 
 [lib]
 name = "aion2_app_lib"

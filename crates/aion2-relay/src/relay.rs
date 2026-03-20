@@ -71,20 +71,24 @@ pub async fn run(listen_addr: SocketAddr, keys: HashMap<String, TunnelKey>) -> R
 
     state.load_keys(keys).await;
 
-    // Install SIGHUP handler for key reload
-    let reload_state = state.clone();
-    tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
-        loop {
-            sighup.recv().await;
-            tracing::info!("SIGHUP received, reloading keys...");
-            match load_keys_from_dir("/etc/aion2-relay/keys") {
-                Ok(keys) => reload_state.load_keys(keys).await,
-                Err(e) => tracing::error!("failed to reload keys: {e}"),
+    // Install SIGHUP handler for key reload (Unix only)
+    #[cfg(unix)]
+    {
+        let reload_state = state.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sighup =
+                signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+            loop {
+                sighup.recv().await;
+                tracing::info!("SIGHUP received, reloading keys...");
+                match load_keys_from_dir("/etc/aion2-relay/keys") {
+                    Ok(keys) => reload_state.load_keys(keys).await,
+                    Err(e) => tracing::error!("failed to reload keys: {e}"),
+                }
             }
-        }
-    });
+        });
+    }
 
     let mut buf = vec![0u8; MAX_PACKET_SIZE];
 
