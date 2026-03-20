@@ -7,7 +7,7 @@ fn main() {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries");
     let _ = std::fs::create_dir_all(&binaries_dir);
 
-    for name in &["aion2-relay", "aion2-proxy", "wintun.dll"] {
+    for name in &["aion2-relay", "aion2-proxy.exe", "wintun.dll"] {
         let path = binaries_dir.join(name);
         if !path.exists() {
             let _ = std::fs::write(&path, b"placeholder");
