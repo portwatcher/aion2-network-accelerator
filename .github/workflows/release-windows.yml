@@ -3,6 +3,11 @@ name: Release Windows Build
 on:
   push:
     branches: ["*"]
+    paths:
+      - "crates/**"
+      - "ui/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
 
 permissions:
   contents: write
@@ -41,7 +46,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: crates/aion2-app
-          tauriScript: npx tauri
+          tauriScript: npx --prefix ../../ui tauri
           tagName: build-${{ github.run_number }}
           releaseName: "Build #${{ github.run_number }}"
           releaseBody: |
