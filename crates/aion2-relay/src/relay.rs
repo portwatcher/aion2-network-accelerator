@@ -1,5 +1,5 @@
 use aion2_common::crypto::{self, KeyId, TunnelKey};
-use aion2_common::protocol::{ConnId, TunnelMessage, MAX_PACKET_SIZE};
+use aion2_common::protocol::{ConnId, SessionId, TunnelMessage, MAX_PACKET_SIZE};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -17,47 +17,53 @@ struct TcpConn {
     shutdown_tx: mpsc::Sender<()>,
 }
 
-/// Per-user state.
-struct UserState {
+/// Per-key configuration (loaded from disk).
+struct KeyInfo {
     key: Arc<TunnelKey>,
     name: String,
-    /// The user's latest UDP address (learned from packets).
+}
+
+/// Per-client session state. Multiple clients can share the same key,
+/// each distinguished by a random SessionId generated at proxy startup.
+struct ClientState {
+    key: Arc<TunnelKey>,
+    name: String,
+    /// The client's latest UDP address (learned from packets).
     addr: Option<SocketAddr>,
-    /// TCP transport: channel to send encrypted packets to the user.
+    /// TCP transport: channel to send encrypted packets to this client.
     tcp_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 /// Shared relay state.
 pub struct RelayState {
     socket: Arc<UdpSocket>,
-    /// key_id → user state. Protected by RwLock for hot-reload.
-    users: RwLock<HashMap<KeyId, UserState>>,
-    /// ConnId → active TCP connection state.
-    conns: RwLock<HashMap<ConnId, TcpConn>>,
+    /// key_id → key info. For decrypting incoming packets. Protected by RwLock for hot-reload.
+    keys: RwLock<HashMap<KeyId, KeyInfo>>,
+    /// session_id → per-client state. Multiple sessions may share a key.
+    clients: RwLock<HashMap<SessionId, ClientState>>,
+    /// (session_id, conn_id) → active TCP connection state. Scoped per session to avoid
+    /// collisions when multiple clients use the same TUN IP.
+    conns: RwLock<HashMap<(SessionId, ConnId), TcpConn>>,
 }
 
 impl RelayState {
     /// Load or reload keys from a map of name → TunnelKey.
     pub async fn load_keys(&self, keys: HashMap<String, TunnelKey>) {
-        let mut users = self.users.write().await;
-        // Keep existing user addresses for keys that didn't change
-        let mut new_users = HashMap::new();
+        let mut key_map = self.keys.write().await;
+        let mut new_keys = HashMap::new();
         for (name, key) in keys {
-            let existing_addr = users.get(&key.key_id).and_then(|u| u.addr);
-            let existing_tcp_tx = users.get(&key.key_id).and_then(|u| u.tcp_tx.clone());
-            new_users.insert(
+            tracing::info!(user = %name, key_id = hex_encode(key.key_id), "loaded key");
+            new_keys.insert(
                 key.key_id,
-                UserState {
+                KeyInfo {
                     key: Arc::new(key),
                     name,
-                    addr: existing_addr,
-                    tcp_tx: existing_tcp_tx,
                 },
             );
         }
-        let old_count = users.len();
-        let new_count = new_users.len();
-        *users = new_users;
+        let old_count = key_map.len();
+        let new_count = new_keys.len();
+        *key_map = new_keys;
         tracing::info!(old_count, new_count, "keys (re)loaded");
     }
 }
@@ -78,7 +84,8 @@ pub async fn run(listen_addr: SocketAddr, keys: HashMap<String, TunnelKey>) -> R
 
     let state = Arc::new(RelayState {
         socket,
-        users: RwLock::new(HashMap::new()),
+        keys: RwLock::new(HashMap::new()),
+        clients: RwLock::new(HashMap::new()),
         conns: RwLock::new(HashMap::new()),
     });
 
@@ -130,7 +137,7 @@ pub async fn run(listen_addr: SocketAddr, keys: HashMap<String, TunnelKey>) -> R
         let (len, peer) = state.socket.recv_from(&mut buf).await?;
         let packet = &buf[..len];
 
-        // Peek key_id to identify user
+        // Peek key_id and session_id to identify the client
         let key_id = match crypto::peek_key_id(packet) {
             Ok(id) => id,
             Err(e) => {
@@ -139,42 +146,56 @@ pub async fn run(listen_addr: SocketAddr, keys: HashMap<String, TunnelKey>) -> R
             }
         };
 
-        // Look up user, decrypt — use read lock for the common path.
-        // Only upgrade to write lock when the user's address changes.
-        let msg = {
-            let users = state.users.read().await;
-            let user = match users.get(&key_id) {
-                Some(u) => u,
+        let session_id = match crypto::peek_session_id(packet) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(%peer, "invalid packet (no session_id): {e}");
+                continue;
+            }
+        };
+
+        // Look up key and decrypt
+        let (msg, key, user_name) = {
+            let keys = state.keys.read().await;
+            match keys.get(&key_id) {
+                Some(ki) => match crypto::open(&ki.key, packet) {
+                    Ok(msg) => (msg, Arc::clone(&ki.key), ki.name.clone()),
+                    Err(e) => {
+                        tracing::warn!(%peer, user = %ki.name, "decrypt failed: {e}");
+                        continue;
+                    }
+                },
                 None => {
                     tracing::warn!(%peer, key_id = hex_encode(key_id), "unknown key_id");
                     continue;
                 }
-            };
-
-            let msg = match crypto::open(&user.key, packet) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    tracing::warn!(%peer, user = %user.name, "decrypt failed: {e}");
-                    continue;
-                }
-            };
-
-            let need_update = user.addr != Some(peer);
-            drop(users);
-
-            // Update user's address only when it actually changed (rare).
-            if need_update {
-                let mut users = state.users.write().await;
-                if let Some(user) = users.get_mut(&key_id) {
-                    tracing::info!(%peer, user = %user.name, "client connected");
-                    user.addr = Some(peer);
-                }
             }
-
-            msg
         };
 
-        handle_message(state.clone(), msg, key_id).await;
+        // Register or update client session (read lock on hot path)
+        let need_update = {
+            let clients = state.clients.read().await;
+            match clients.get(&session_id) {
+                Some(c) => c.addr != Some(peer),
+                None => true,
+            }
+        };
+
+        if need_update {
+            let mut clients = state.clients.write().await;
+            let client = clients.entry(session_id).or_insert_with(|| {
+                tracing::info!(%peer, user = %user_name, session = hex_encode(session_id), "new client session (UDP)");
+                ClientState {
+                    key: Arc::clone(&key),
+                    name: user_name,
+                    addr: None,
+                    tcp_tx: None,
+                }
+            });
+            client.addr = Some(peer);
+        }
+
+        handle_message(state.clone(), msg, session_id).await;
     }
 }
 
@@ -226,11 +247,12 @@ async fn handle_tcp_tunnel(state: Arc<RelayState>, stream: TcpStream, peer: Sock
     // Read the first message to identify the user (authenticate)
     let first_packet = read_framed(&mut tcp_read).await?;
     let key_id = crypto::peek_key_id(&first_packet)?;
+    let session_id = crypto::peek_session_id(&first_packet)?;
 
     let (key, user_name) = {
-        let users = state.users.read().await;
-        match users.get(&key_id) {
-            Some(u) => (Arc::clone(&u.key), u.name.clone()),
+        let keys = state.keys.read().await;
+        match keys.get(&key_id) {
+            Some(ki) => (Arc::clone(&ki.key), ki.name.clone()),
             None => {
                 anyhow::bail!("unknown key_id {}", hex_encode(key_id));
             }
@@ -239,22 +261,28 @@ async fn handle_tcp_tunnel(state: Arc<RelayState>, stream: TcpStream, peer: Sock
 
     // Decrypt the first message to verify authentication
     let first_msg = crypto::open(&key, &first_packet)?;
-    tracing::info!(%peer, user = %user_name, "TCP tunnel authenticated");
+    tracing::info!(%peer, user = %user_name, session = hex_encode(session_id), "TCP tunnel authenticated");
 
-    // Create a channel for sending messages back to this user over TCP
+    // Create a channel for sending messages back to this client over TCP
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8192);
 
-    // Register TCP transport for this user
+    // Register client session with TCP transport
     {
-        let mut users = state.users.write().await;
-        if let Some(user) = users.get_mut(&key_id) {
-            user.tcp_tx = Some(tx.clone());
-            user.addr = Some(peer);
-        }
+        let mut clients = state.clients.write().await;
+        let client = clients.entry(session_id).or_insert_with(|| {
+            ClientState {
+                key: Arc::clone(&key),
+                name: user_name.clone(),
+                addr: None,
+                tcp_tx: None,
+            }
+        });
+        client.tcp_tx = Some(tx.clone());
+        client.addr = Some(peer);
     }
 
     // Spawn TCP write task: relay→proxy direction
-    let write_key_id = key_id;
+    let write_session_id = session_id;
     let write_state = state.clone();
     let write_task = tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {
@@ -267,15 +295,15 @@ async fn handle_tcp_tunnel(state: Arc<RelayState>, stream: TcpStream, peer: Sock
             }
         }
         // Clean up TCP transport on disconnect
-        let mut users = write_state.users.write().await;
-        if let Some(user) = users.get_mut(&write_key_id) {
-            user.tcp_tx = None;
-            tracing::info!(user = %user.name, "TCP tunnel write task ended");
+        let mut clients = write_state.clients.write().await;
+        if let Some(client) = clients.get_mut(&write_session_id) {
+            client.tcp_tx = None;
+            tracing::info!(user = %client.name, "TCP tunnel write task ended");
         }
     });
 
     // Process the first message we already decrypted
-    handle_message(state.clone(), first_msg, key_id).await;
+    handle_message(state.clone(), first_msg, session_id).await;
 
     // Read loop: proxy→relay direction
     loop {
@@ -290,9 +318,9 @@ async fn handle_tcp_tunnel(state: Arc<RelayState>, stream: TcpStream, peer: Sock
         };
 
         let msg = {
-            let users = state.users.read().await;
-            match users.get(&peeked_key_id) {
-                Some(user) => match crypto::open(&user.key, &packet) {
+            let keys = state.keys.read().await;
+            match keys.get(&peeked_key_id) {
+                Some(ki) => match crypto::open(&ki.key, &packet) {
                     Ok(msg) => msg,
                     Err(e) => {
                         tracing::warn!(%peer, "TCP decrypt failed: {e}");
@@ -303,16 +331,17 @@ async fn handle_tcp_tunnel(state: Arc<RelayState>, stream: TcpStream, peer: Sock
             }
         };
 
-        handle_message(state.clone(), msg, peeked_key_id).await;
+        // All messages on this TCP connection belong to the same session
+        handle_message(state.clone(), msg, session_id).await;
     }
 
     tracing::info!(%peer, user = %user_name, "TCP tunnel disconnected");
 
-    // Clean up TCP transport
+    // Clean up TCP transport and remove client session
     {
-        let mut users = state.users.write().await;
-        if let Some(user) = users.get_mut(&key_id) {
-            user.tcp_tx = None;
+        let mut clients = state.clients.write().await;
+        if let Some(client) = clients.get_mut(&session_id) {
+            client.tcp_tx = None;
         }
     }
 
@@ -334,13 +363,13 @@ async fn read_framed(reader: &mut tokio::net::tcp::OwnedReadHalf) -> Result<Vec<
     Ok(buf)
 }
 
-async fn handle_message(state: Arc<RelayState>, msg: TunnelMessage, key_id: KeyId) {
+async fn handle_message(state: Arc<RelayState>, msg: TunnelMessage, session_id: SessionId) {
     match msg {
         TunnelMessage::Connect(conn) => {
-            tracing::info!(%conn, key_id = hex_encode(key_id), "connect request");
+            tracing::info!(%conn, session = hex_encode(session_id), "connect request");
             let state = state.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connect(state, conn, key_id).await {
+                if let Err(e) = handle_connect(state, conn, session_id).await {
                     tracing::error!(%conn, "connect failed: {e}");
                 }
             });
@@ -348,7 +377,7 @@ async fn handle_message(state: Arc<RelayState>, msg: TunnelMessage, key_id: KeyI
 
         TunnelMessage::Data { conn, payload } => {
             let conns = state.conns.read().await;
-            if let Some(tcp) = conns.get(&conn) {
+            if let Some(tcp) = conns.get(&(session_id, conn)) {
                 if tcp.tx.try_send(payload).is_err() {
                     tracing::warn!(%conn, "TCP write channel full or closed");
                 }
@@ -357,7 +386,7 @@ async fn handle_message(state: Arc<RelayState>, msg: TunnelMessage, key_id: KeyI
 
         TunnelMessage::Shutdown(conn) => {
             let conns = state.conns.read().await;
-            if let Some(tcp) = conns.get(&conn) {
+            if let Some(tcp) = conns.get(&(session_id, conn)) {
                 let _ = tcp.shutdown_tx.try_send(());
             }
         }
@@ -365,7 +394,7 @@ async fn handle_message(state: Arc<RelayState>, msg: TunnelMessage, key_id: KeyI
         TunnelMessage::Reset(conn) => {
             tracing::info!(%conn, "reset");
             let mut conns = state.conns.write().await;
-            conns.remove(&conn);
+            conns.remove(&(session_id, conn));
         }
 
         TunnelMessage::Ping {
@@ -376,7 +405,7 @@ async fn handle_message(state: Arc<RelayState>, msg: TunnelMessage, key_id: KeyI
                 seq,
                 client_timestamp_ms: timestamp_ms,
             };
-            send_to_user(&state, key_id, &reply).await;
+            send_to_client(&state, session_id, &reply).await;
         }
 
         _ => {
@@ -386,7 +415,7 @@ async fn handle_message(state: Arc<RelayState>, msg: TunnelMessage, key_id: KeyI
 }
 
 /// Open a real TCP connection to the game server and bridge it to the tunnel.
-async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> Result<()> {
+async fn handle_connect(state: Arc<RelayState>, conn: ConnId, session_id: SessionId) -> Result<()> {
     let dst = SocketAddr::new(conn.dst_addr().into(), conn.dst_port);
     tracing::info!(%conn, %dst, "connecting to game server");
 
@@ -394,14 +423,14 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
         Ok(s) => {
             s.set_nodelay(true)?;
             tracing::info!(%conn, "connected to game server");
-            send_to_user(&state, key_id, &TunnelMessage::Connected(conn)).await;
+            send_to_client(&state, session_id, &TunnelMessage::Connected(conn)).await;
             s
         }
         Err(e) => {
             tracing::error!(%conn, "TCP connect failed: {e}");
-            send_to_user(
+            send_to_client(
                 &state,
-                key_id,
+                session_id,
                 &TunnelMessage::ConnectFailed {
                     conn,
                     reason: e.to_string(),
@@ -419,10 +448,10 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
     // Channel for shutdown signal
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-    // Register the connection
+    // Register the connection (scoped per session)
     {
         let mut conns = state.conns.write().await;
-        conns.insert(conn, TcpConn { tx: data_tx, shutdown_tx });
+        conns.insert((session_id, conn), TcpConn { tx: data_tx, shutdown_tx });
     }
 
     // Shared write counters so read task can log them on close
@@ -433,6 +462,7 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
     let write_state = state.clone();
     let wb = write_bytes.clone();
     let wm = write_msgs.clone();
+    let write_session_id = session_id;
     let write_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -466,11 +496,12 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
             }
         }
         let mut conns = write_state.conns.write().await;
-        conns.remove(&conn);
+        conns.remove(&(write_session_id, conn));
     });
 
     // Task: TCP read → tunnel (read from game server, send to user)
     let read_state = state.clone();
+    let read_session_id = session_id;
     tokio::spawn(async move {
         let mut buf = vec![0u8; aion2_common::protocol::MAX_PAYLOAD_SIZE];
         let mut bytes_read: u64 = 0;
@@ -488,7 +519,7 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
                     // Log last bytes for protocol analysis
                     let last_hex: String = last_data.iter().take(64).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
                     tracing::info!(%conn, bytes_read, read_msgs, bytes_written=bw, write_msgs=wm, lifetime, idle_read_ms=idle_read, last_bytes=last_hex, last_len=last_data.len(), "game server closed connection");
-                    send_to_user(&read_state, key_id, &TunnelMessage::Shutdown(conn)).await;
+                    send_to_client(&read_state, read_session_id, &TunnelMessage::Shutdown(conn)).await;
                     break;
                 }
                 Ok(n) => {
@@ -500,45 +531,45 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
                         conn,
                         payload: buf[..n].to_vec(),
                     };
-                    send_to_user(&read_state, key_id, &msg).await;
+                    send_to_client(&read_state, read_session_id, &msg).await;
                 }
                 Err(e) => {
                     let bw = write_bytes.load(Ordering::Relaxed);
                     let wm = write_msgs.load(Ordering::Relaxed);
                     let lifetime = start.elapsed().as_secs();
                     tracing::warn!(%conn, bytes_read, read_msgs, bytes_written=bw, write_msgs=wm, lifetime, "TCP read error: {e}");
-                    send_to_user(&read_state, key_id, &TunnelMessage::Reset(conn)).await;
+                    send_to_client(&read_state, read_session_id, &TunnelMessage::Reset(conn)).await;
                     break;
                 }
             }
         }
         write_task.abort();
         let mut conns = read_state.conns.write().await;
-        conns.remove(&conn);
+        conns.remove(&(read_session_id, conn));
     });
 
     Ok(())
 }
 
-/// Encrypt and send a TunnelMessage to a specific user identified by key_id.
+/// Encrypt and send a TunnelMessage to a specific client identified by session_id.
 /// Prefers TCP transport when available (reliable), falls back to UDP.
-async fn send_to_user(state: &RelayState, key_id: KeyId, msg: &TunnelMessage) {
+async fn send_to_client(state: &RelayState, session_id: SessionId, msg: &TunnelMessage) {
     let (addr, key, tcp_tx) = {
-        let users = state.users.read().await;
-        match users.get(&key_id) {
-            Some(user) => (
-                user.addr,
-                Arc::clone(&user.key),
-                user.tcp_tx.clone(),
+        let clients = state.clients.read().await;
+        match clients.get(&session_id) {
+            Some(client) => (
+                client.addr,
+                Arc::clone(&client.key),
+                client.tcp_tx.clone(),
             ),
             None => {
-                tracing::warn!(key_id = hex_encode(key_id), "user no longer exists");
+                tracing::warn!(session = hex_encode(session_id), "client session no longer exists");
                 return;
             }
         }
     };
 
-    let packet = match crypto::seal(&key, msg) {
+    let packet = match crypto::seal(&key, &session_id, msg) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!("failed to encrypt message: {e}");
@@ -549,7 +580,7 @@ async fn send_to_user(state: &RelayState, key_id: KeyId, msg: &TunnelMessage) {
     // Prefer TCP (reliable, ordered) over UDP
     if let Some(tx) = tcp_tx {
         if tx.try_send(packet).is_err() {
-            tracing::warn!(key_id = hex_encode(key_id), "TCP send channel full or closed");
+            tracing::warn!(session = hex_encode(session_id), "TCP send channel full or closed");
         }
         return;
     }
@@ -560,7 +591,7 @@ async fn send_to_user(state: &RelayState, key_id: KeyId, msg: &TunnelMessage) {
             tracing::warn!(%addr, "failed to send to client via UDP: {e}");
         }
     } else {
-        tracing::warn!(key_id = hex_encode(key_id), "user has no address yet");
+        tracing::warn!(session = hex_encode(session_id), "client has no address yet");
     }
 }
 

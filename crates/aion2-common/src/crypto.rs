@@ -13,6 +13,12 @@ pub type KeyId = [u8; 4];
 /// Size of the key ID prefix on the wire.
 pub const KEY_ID_SIZE: usize = 4;
 
+/// Size of the session ID on the wire (8 bytes).
+pub const SESSION_ID_SIZE: usize = 8;
+
+/// Total size of the unencrypted header: key_id + session_id.
+pub const HEADER_SIZE: usize = KEY_ID_SIZE + SESSION_ID_SIZE;
+
 /// Shared symmetric key for the tunnel (256-bit).
 /// Exchanged out-of-band (e.g., over SSH during relay setup).
 #[derive(Clone)]
@@ -103,20 +109,20 @@ impl TunnelKey {
     }
 }
 
-/// Encrypt a tunnel message and prepend the key_id.
-/// Wire format: `key_id (4B) || nonce (24B) || ciphertext || tag (16B)`
-pub fn seal(key: &TunnelKey, msg: &crate::protocol::TunnelMessage) -> Result<Vec<u8>> {
+/// Encrypt a tunnel message and prepend the key_id and session_id.
+/// Wire format: `key_id (4B) || session_id (8B) || nonce (24B) || ciphertext || tag (16B)`
+pub fn seal(key: &TunnelKey, session_id: &crate::protocol::SessionId, msg: &crate::protocol::TunnelMessage) -> Result<Vec<u8>> {
     let plaintext = crate::protocol::encode_message(msg)?;
-    // Single allocation: key_id + nonce + ciphertext + tag
-    let mut packet = Vec::with_capacity(KEY_ID_SIZE + NONCE_SIZE + plaintext.len() + TAG_SIZE);
+    let mut packet = Vec::with_capacity(HEADER_SIZE + NONCE_SIZE + plaintext.len() + TAG_SIZE);
     packet.extend_from_slice(&key.key_id);
+    packet.extend_from_slice(session_id);
     key.encrypt_into(&plaintext, &mut packet)?;
     Ok(packet)
 }
 
 /// Extract the key_id from a wire packet without decrypting.
 pub fn peek_key_id(packet: &[u8]) -> Result<KeyId> {
-    if packet.len() < KEY_ID_SIZE + NONCE_SIZE + TAG_SIZE {
+    if packet.len() < HEADER_SIZE + NONCE_SIZE + TAG_SIZE {
         return Err(anyhow!("packet too short for key_id extraction"));
     }
     let mut id = [0u8; 4];
@@ -124,12 +130,22 @@ pub fn peek_key_id(packet: &[u8]) -> Result<KeyId> {
     Ok(id)
 }
 
-/// Decrypt a wire packet (strip key_id prefix, then decrypt + deserialize).
+/// Extract the session_id from a wire packet without decrypting.
+pub fn peek_session_id(packet: &[u8]) -> Result<crate::protocol::SessionId> {
+    if packet.len() < HEADER_SIZE + NONCE_SIZE + TAG_SIZE {
+        return Err(anyhow!("packet too short for session_id extraction"));
+    }
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&packet[KEY_ID_SIZE..KEY_ID_SIZE + SESSION_ID_SIZE]);
+    Ok(id)
+}
+
+/// Decrypt a wire packet (strip key_id + session_id prefix, then decrypt + deserialize).
 pub fn open(key: &TunnelKey, packet: &[u8]) -> Result<crate::protocol::TunnelMessage> {
-    if packet.len() < KEY_ID_SIZE + NONCE_SIZE + TAG_SIZE {
+    if packet.len() < HEADER_SIZE + NONCE_SIZE + TAG_SIZE {
         return Err(anyhow!("packet too short"));
     }
-    let plaintext = key.decrypt(&packet[KEY_ID_SIZE..])?;
+    let plaintext = key.decrypt(&packet[HEADER_SIZE..])?;
     crate::protocol::decode_message(&plaintext)
 }
 
@@ -151,6 +167,7 @@ mod tests {
     #[test]
     fn seal_open_roundtrip() {
         let (_, key) = TunnelKey::generate();
+        let session_id: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
         let conn = ConnId::new(
             Ipv4Addr::new(10, 0, 0, 1),
             5000,
@@ -161,7 +178,12 @@ mod tests {
             conn,
             payload: vec![1, 2, 3, 4, 5],
         };
-        let packet = seal(&key, &msg).unwrap();
+        let packet = seal(&key, &session_id, &msg).unwrap();
+
+        // Verify session_id can be peeked
+        let peeked_sid = peek_session_id(&packet).unwrap();
+        assert_eq!(peeked_sid, session_id);
+
         let decoded = open(&key, &packet).unwrap();
         match decoded {
             TunnelMessage::Data { conn: c, payload } => {

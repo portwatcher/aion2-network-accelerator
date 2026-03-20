@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
+/// 8-byte random session identifier, generated per proxy instance.
+/// Allows multiple clients sharing the same key to coexist on the same relay.
+pub type SessionId = [u8; 8];
+
 /// Unique identifier for a proxied TCP connection (src_ip:src_port → dst_ip:dst_port).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnId {

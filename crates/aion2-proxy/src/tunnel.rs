@@ -1,5 +1,5 @@
 use aion2_common::crypto::{self, TunnelKey};
-use aion2_common::protocol::{ConnId, TunnelMessage, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE};
+use aion2_common::protocol::{ConnId, SessionId, TunnelMessage, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -34,6 +34,7 @@ struct ConnState {
 /// Shared tunnel state.
 pub struct TunnelState {
     pub key: TunnelKey,
+    pub session_id: SessionId,
     socket: Arc<UdpSocket>,
     pub relay_addr: SocketAddr,
     conns: RwLock<HashMap<ConnId, ConnState>>,
@@ -49,6 +50,13 @@ pub struct TunnelState {
 }
 
 pub async fn run(relay_addr: SocketAddr, key: TunnelKey) -> Result<()> {
+    // Generate a random session ID for this proxy instance.
+    // This allows multiple clients sharing the same key to coexist on the relay.
+    let mut session_id: SessionId = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut session_id);
+    let session_hex: String = session_id.iter().map(|b| format!("{b:02x}")).collect();
+    tracing::info!(session = %session_hex, "generated session ID");
+
     // Create UDP socket for ping/pong latency measurement
     let sock2 = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
     sock2.set_recv_buffer_size(2 * 1024 * 1024)?;
@@ -74,6 +82,7 @@ pub async fn run(relay_addr: SocketAddr, key: TunnelKey) -> Result<()> {
 
     let state = Arc::new(TunnelState {
         key,
+        session_id,
         socket,
         relay_addr,
         conns: RwLock::new(HashMap::new()),
@@ -338,7 +347,7 @@ async fn ping_loop(state: Arc<TunnelState>) {
 
 /// Encrypt and send a message to the relay via TCP (reliable).
 async fn send_to_relay(state: &TunnelState, msg: &TunnelMessage) -> Result<()> {
-    let packet = crypto::seal(&state.key, msg)?;
+    let packet = crypto::seal(&state.key, &state.session_id, msg)?;
     if state.tcp_tx.send(packet).await.is_err() {
         anyhow::bail!("TCP tunnel write channel closed");
     }
@@ -347,7 +356,7 @@ async fn send_to_relay(state: &TunnelState, msg: &TunnelMessage) -> Result<()> {
 
 /// Encrypt and send a message to the relay via UDP (for ping/pong).
 async fn send_to_relay_udp(state: &TunnelState, msg: &TunnelMessage) -> Result<()> {
-    let packet = crypto::seal(&state.key, msg)?;
+    let packet = crypto::seal(&state.key, &state.session_id, msg)?;
     state.socket.send_to(&packet, state.relay_addr).await?;
     Ok(())
 }
