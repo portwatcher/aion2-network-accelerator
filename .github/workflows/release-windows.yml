@@ -72,6 +72,12 @@ jobs:
           name: aion2-relay-linux
           path: crates/aion2-app/binaries
 
+      - name: Verify relay binary is Linux ELF
+        shell: bash
+        run: |
+          file crates/aion2-app/binaries/aion2-relay
+          file crates/aion2-app/binaries/aion2-relay | grep -q "ELF" || { echo "ERROR: relay binary is not a Linux ELF"; exit 1; }
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -79,6 +85,7 @@ jobs:
         with:
           projectPath: crates/aion2-app
           tauriScript: npx --prefix ../../ui tauri
+          args: --config "{\"build\":{\"beforeBuildCommand\":\"\",\"beforeDevCommand\":\"\"}}"
           tagName: build-${{ github.run_number }}
           releaseName: "Build #${{ github.run_number }}"
           releaseBody: |

@@ -6,21 +6,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 /// State for a single proxied TCP connection.
+#[allow(dead_code)]
 struct TcpConn {
-    /// Send data to the TCP write half.
-    tx: mpsc::Sender<Vec<u8>>,
-    /// Send shutdown signal.
-    shutdown_tx: mpsc::Sender<()>,
+    /// Direct handle to the TCP write half (no intermediate channel).
+    writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     /// Which user owns this connection (for routing responses).
     key_id: KeyId,
 }
 
 /// Per-user state.
 struct UserState {
-    key: TunnelKey,
+    key: Arc<TunnelKey>,
     name: String,
     /// The user's latest UDP address (learned from packets).
     addr: Option<SocketAddr>,
@@ -46,7 +45,7 @@ impl RelayState {
             new_users.insert(
                 key.key_id,
                 UserState {
-                    key,
+                    key: Arc::new(key),
                     name,
                     addr: existing_addr,
                 },
@@ -60,7 +59,13 @@ impl RelayState {
 }
 
 pub async fn run(listen_addr: SocketAddr, keys: HashMap<String, TunnelKey>) -> Result<()> {
-    let socket = Arc::new(UdpSocket::bind(listen_addr).await?);
+    // Create UDP socket with large buffers to absorb traffic bursts.
+    let sock2 = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    sock2.set_recv_buffer_size(4 * 1024 * 1024)?;
+    sock2.set_send_buffer_size(4 * 1024 * 1024)?;
+    sock2.set_nonblocking(true)?;
+    sock2.bind(&socket2::SockAddr::from(listen_addr))?;
+    let socket = Arc::new(UdpSocket::from_std(sock2.into())?);
     tracing::info!("listening on {listen_addr}");
 
     let state = Arc::new(RelayState {
@@ -105,10 +110,11 @@ pub async fn run(listen_addr: SocketAddr, keys: HashMap<String, TunnelKey>) -> R
             }
         };
 
-        // Look up user, decrypt
+        // Look up user, decrypt — use read lock for the common path.
+        // Only upgrade to write lock when the user's address changes.
         let msg = {
-            let mut users = state.users.write().await;
-            let user = match users.get_mut(&key_id) {
+            let users = state.users.read().await;
+            let user = match users.get(&key_id) {
                 Some(u) => u,
                 None => {
                     tracing::warn!(%peer, key_id = hex_encode(key_id), "unknown key_id");
@@ -124,10 +130,16 @@ pub async fn run(listen_addr: SocketAddr, keys: HashMap<String, TunnelKey>) -> R
                 }
             };
 
-            // Update user's address
-            if user.addr != Some(peer) {
-                tracing::info!(%peer, user = %user.name, "client connected");
-                user.addr = Some(peer);
+            let need_update = user.addr != Some(peer);
+            drop(users);
+
+            // Update user's address only when it actually changed (rare).
+            if need_update {
+                let mut users = state.users.write().await;
+                if let Some(user) = users.get_mut(&key_id) {
+                    tracing::info!(%peer, user = %user.name, "client connected");
+                    user.addr = Some(peer);
+                }
             }
 
             msg
@@ -188,20 +200,26 @@ async fn handle_message(state: Arc<RelayState>, msg: TunnelMessage, key_id: KeyI
         }
 
         TunnelMessage::Data { conn, payload } => {
-            let conns = state.conns.read().await;
-            if let Some(tcp) = conns.get(&conn) {
-                if tcp.tx.send(payload).await.is_err() {
-                    tracing::warn!(%conn, "TCP write channel closed");
+            let writer = {
+                let conns = state.conns.read().await;
+                conns.get(&conn).map(|tcp| Arc::clone(&tcp.writer))
+            };
+            if let Some(writer) = writer {
+                let mut w = writer.lock().await;
+                if let Err(e) = w.write_all(&payload).await {
+                    tracing::warn!(%conn, "TCP write error: {e}");
                 }
-            } else {
-                tracing::warn!(%conn, "data for unknown connection");
             }
         }
 
         TunnelMessage::Shutdown(conn) => {
-            let conns = state.conns.read().await;
-            if let Some(tcp) = conns.get(&conn) {
-                let _ = tcp.shutdown_tx.send(()).await;
+            let writer = {
+                let conns = state.conns.read().await;
+                conns.get(&conn).map(|tcp| Arc::clone(&tcp.writer))
+            };
+            if let Some(writer) = writer {
+                let mut w = writer.lock().await;
+                let _ = w.shutdown().await;
             }
         }
 
@@ -255,46 +273,16 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
         }
     };
 
-    let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
+    let (mut tcp_read, tcp_write) = tcp_stream.into_split();
+    let writer = Arc::new(tokio::sync::Mutex::new(tcp_write));
 
-    // Channel for data from tunnel → TCP write
-    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(64);
-    // Channel for shutdown signal
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-    // Register the connection
+    // Register the connection (writer accessible directly from main loop)
     {
         let mut conns = state.conns.write().await;
-        conns.insert(conn, TcpConn { tx: data_tx, shutdown_tx, key_id });
+        conns.insert(conn, TcpConn { writer, key_id });
     }
 
-    // Task: tunnel → TCP (write to game server)
-    let write_state = state.clone();
-    let write_task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                data = data_rx.recv() => {
-                    match data {
-                        Some(payload) => {
-                            if let Err(e) = tcp_write.write_all(&payload).await {
-                                tracing::warn!(%conn, "TCP write error: {e}");
-                                break;
-                            }
-                        }
-                        None => break, // channel closed
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    let _ = tcp_write.shutdown().await;
-                    break;
-                }
-            }
-        }
-        let mut conns = write_state.conns.write().await;
-        conns.remove(&conn);
-    });
-
-    // Task: TCP read → tunnel (read from game server, send to user)
+    // Single task: TCP read → tunnel (game server → user)
     let read_state = state.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; aion2_common::protocol::MAX_PAYLOAD_SIZE];
@@ -319,8 +307,7 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
                 }
             }
         }
-        // Clean up: abort write task, remove connection
-        write_task.abort();
+        // Clean up: remove connection (drops writer → sends FIN)
         let mut conns = read_state.conns.write().await;
         conns.remove(&conn);
     });
@@ -334,7 +321,7 @@ async fn send_to_user(state: &RelayState, key_id: KeyId, msg: &TunnelMessage) {
         let users = state.users.read().await;
         match users.get(&key_id) {
             Some(user) => match user.addr {
-                Some(a) => (a, user.key.clone()),
+                Some(a) => (a, Arc::clone(&user.key)),
                 None => {
                     tracing::warn!(key_id = hex_encode(key_id), "user has no address yet");
                     return;

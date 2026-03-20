@@ -56,7 +56,7 @@ const tab = ref<'proxy' | 'setup'>('proxy');
 const status = ref<ProxyStatus>({ ...DEFAULT_STATUS });
 const logs = ref<LogEntry[]>([]);
 const showSettings = ref(true);
-const relayAddr = ref('130.94.37.247:443');
+const relayAddr = ref('');
 const keyHex = ref('');
 const loading = ref(false);
 const logEl = ref<HTMLDivElement | null>(null);
@@ -69,6 +69,9 @@ const sshPassword = ref('');
 const deploying = ref(false);
 const deployLogs = ref<string[]>([]);
 const deployLogEl = ref<HTMLDivElement | null>(null);
+const deployCopied = ref(false);
+const logsCopied = ref(false);
+const keyCopied = ref(false);
 
 // Connection profiles state
 const profiles = ref<Profile[]>([]);
@@ -187,7 +190,7 @@ async function handleSaveProfile() {
     profileName.value = '';
     await setActiveProfile(name);
   } catch (e) {
-    addLog({ timestamp: new Date().toISOString(), level: 'error', message: `Save profile: ${e}` });
+    addLog({ timestamp: new Date().toLocaleTimeString(), level: 'error', message: `Save profile: ${e}` });
   }
 }
 
@@ -198,7 +201,7 @@ async function handleDeleteProfile(name: string) {
     profiles.value = profs;
     activeProfileName.value = active;
   } catch (e) {
-    addLog({ timestamp: new Date().toISOString(), level: 'error', message: `Delete profile: ${e}` });
+    addLog({ timestamp: new Date().toLocaleTimeString(), level: 'error', message: `Delete profile: ${e}` });
   }
 }
 
@@ -215,7 +218,7 @@ async function handleCheckUpdates() {
 
 async function handleStart() {
   if (!keyHex.value.trim()) {
-    addLog({ timestamp: new Date().toISOString(), level: 'error', message: 'Please enter a key' });
+    addLog({ timestamp: new Date().toLocaleTimeString(), level: 'error', message: 'Please enter a key' });
     return;
   }
   loading.value = true;
@@ -228,9 +231,9 @@ async function handleStart() {
     };
     await startProxy(config);
     showSettings.value = false;
-    addLog({ timestamp: new Date().toISOString(), level: 'info', message: 'Proxy started' });
+    addLog({ timestamp: new Date().toLocaleTimeString(), level: 'info', message: 'Proxy started' });
   } catch (e) {
-    addLog({ timestamp: new Date().toISOString(), level: 'error', message: `Failed to start: ${e}` });
+    addLog({ timestamp: new Date().toLocaleTimeString(), level: 'error', message: `Failed to start: ${e}` });
   } finally {
     loading.value = false;
   }
@@ -241,9 +244,9 @@ async function handleStop() {
   try {
     await stopProxy();
     status.value = { ...DEFAULT_STATUS };
-    addLog({ timestamp: new Date().toISOString(), level: 'info', message: 'Proxy stopped' });
+    addLog({ timestamp: new Date().toLocaleTimeString(), level: 'info', message: 'Proxy stopped' });
   } catch (e) {
-    addLog({ timestamp: new Date().toISOString(), level: 'error', message: `Failed to stop: ${e}` });
+    addLog({ timestamp: new Date().toLocaleTimeString(), level: 'error', message: `Failed to stop: ${e}` });
   } finally {
     loading.value = false;
   }
@@ -276,6 +279,27 @@ async function handleDeploy() {
     deployLogs.value.push(`ERROR: ${e}`);
   } finally {
     deploying.value = false;
+  }
+}
+
+function copyDeployLogs() {
+  navigator.clipboard.writeText(deployLogs.value.join('\n'));
+  deployCopied.value = true;
+  setTimeout(() => { deployCopied.value = false; }, 2000);
+}
+
+function copyLogs() {
+  const text = logs.value.map(e => `${e.timestamp} [${e.level}] ${e.message}`).join('\n');
+  navigator.clipboard.writeText(text);
+  logsCopied.value = true;
+  setTimeout(() => { logsCopied.value = false; }, 2000);
+}
+
+function copyKey() {
+  if (keyHex.value.trim()) {
+    navigator.clipboard.writeText(keyHex.value.trim());
+    keyCopied.value = true;
+    setTimeout(() => { keyCopied.value = false; }, 2000);
   }
 }
 
@@ -321,7 +345,7 @@ function onProfileSelect(event: Event) {
               <div :class="['stat-value', rttClass(status.rtt_ms)]">
                 {{ status.rtt_ms !== null ? `${status.rtt_ms}` : '\u2014' }}
               </div>
-              <div class="stat-label">Latency (ms)</div>
+              <div class="stat-label" title="UDP tunnel round-trip time. In-game ping will be slightly higher due to relay-to-server latency.">Tunnel RTT (ms)</div>
             </div>
             <div class="stat-box">
               <div class="stat-value">{{ status.active_connections }}</div>
@@ -372,7 +396,16 @@ function onProfileSelect(event: Event) {
               </div>
               <div class="form-group">
                 <label class="form-label">Key (hex)</label>
-                <input class="form-input" type="password" v-model="keyHex" placeholder="64-character hex key" :disabled="isRunning" />
+                <div style="display: flex; gap: 6px; align-items: center">
+                  <input class="form-input" type="password" v-model="keyHex" placeholder="64-character hex key" :disabled="isRunning" style="flex: 1" />
+                  <button
+                    class="btn btn-secondary"
+                    style="padding: 6px 10px; font-size: 12px; white-space: nowrap"
+                    @click="copyKey"
+                    :disabled="!keyHex.trim()"
+                    title="Copy key to clipboard to share with friends"
+                  >{{ keyCopied ? '\u2713 Copied' : 'Copy Key' }}</button>
+                </div>
               </div>
             </div>
 
@@ -426,14 +459,17 @@ function onProfileSelect(event: Event) {
         <div class="card" style="flex: 1; display: flex; flex-direction: column; min-height: 0">
           <div class="card-header">
             <span class="card-title">Logs</span>
-            <button class="settings-toggle" @click="logs = []">Clear</button>
+            <div style="display: flex; gap: 8px">
+              <button class="settings-toggle" @click="copyLogs">{{ logsCopied ? 'Copied!' : 'Copy' }}</button>
+              <button class="settings-toggle" @click="logs = []">Clear</button>
+            </div>
           </div>
           <div class="log-viewer" ref="logEl" style="flex: 1">
             <span v-if="logs.length === 0" class="log-line" style="color: var(--text-dim)">
               No logs yet. Start the proxy to see activity.
             </span>
             <span v-for="(entry, i) in logs" :key="i" class="log-line">
-              <span class="log-time">{{ new Date(entry.timestamp).toLocaleTimeString() }} </span>
+              <span class="log-time">{{ entry.timestamp }} </span>
               <span :class="`log-${entry.level}`">{{ entry.message }}</span>
               {{ '\n' }}
             </span>
@@ -488,7 +524,10 @@ function onProfileSelect(event: Event) {
         <div v-if="deployLogs.length > 0" class="card" style="flex: 1; display: flex; flex-direction: column; min-height: 0">
           <div class="card-header">
             <span class="card-title">Deploy Progress</span>
-            <button class="settings-toggle" @click="deployLogs = []">Clear</button>
+            <div style="display: flex; gap: 8px">
+              <button class="settings-toggle" @click="copyDeployLogs">{{ deployCopied ? 'Copied!' : 'Copy' }}</button>
+              <button class="settings-toggle" @click="deployLogs = []">Clear</button>
+            </div>
           </div>
           <div class="log-viewer" ref="deployLogEl" style="flex: 1">
             <span v-for="(msg, i) in deployLogs" :key="i" class="log-line">

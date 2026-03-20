@@ -8,32 +8,17 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
 
-/// Game IP ranges to route through the tunnel.
-const GAME_SUBNETS: &[(&str, u8)] = &[
-    ("210.242.0.0", 16),   // HiNet game servers
-    ("216.107.244.0", 24),  // NCSOFT auth
-    ("216.107.253.0", 24),  // NCSOFT auth
-];
-
-/// Check if an IP should be routed through the tunnel.
-pub fn is_game_ip(ip: Ipv4Addr) -> bool {
-    let ip_u32 = u32::from(ip);
-    for &(subnet_str, prefix_len) in GAME_SUBNETS {
-        let subnet: Ipv4Addr = subnet_str.parse().unwrap();
-        let subnet_u32 = u32::from(subnet);
-        let mask = if prefix_len == 0 {
-            0
-        } else {
-            !0u32 << (32 - prefix_len)
-        };
-        if (ip_u32 & mask) == (subnet_u32 & mask) {
-            return true;
-        }
-    }
-    false
+/// Events from the relay that the TUN handler needs to process.
+pub enum RelayEvent {
+    Connected(ConnId),
+    ConnectFailed { conn: ConnId, reason: String },
+    Data { conn: ConnId, payload: Vec<u8> },
+    Shutdown(ConnId),
+    Reset(ConnId),
 }
 
 /// Per-connection state on the client side.
+#[allow(dead_code)]
 struct ConnState {
     /// Buffered data received from the relay (game server → client).
     rx_buf: Vec<u8>,
@@ -49,26 +34,40 @@ struct ConnState {
 pub struct TunnelState {
     pub key: TunnelKey,
     socket: Arc<UdpSocket>,
-    relay_addr: SocketAddr,
+    pub relay_addr: SocketAddr,
     conns: RwLock<HashMap<ConnId, ConnState>>,
+    /// Channel for relay events consumed by the TUN handler.
+    relay_events: mpsc::Sender<RelayEvent>,
     /// Stats
     ping_seq: std::sync::atomic::AtomicU64,
     pub last_rtt_ms: std::sync::atomic::AtomicU64,
+    pub bytes_tx: std::sync::atomic::AtomicU64,
+    pub bytes_rx: std::sync::atomic::AtomicU64,
 }
 
 pub async fn run(relay_addr: SocketAddr, key: TunnelKey) -> Result<()> {
-    // Bind to any port for outgoing UDP
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    // Create UDP socket with large buffers to reduce packet loss under burst.
+    let sock2 = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    sock2.set_recv_buffer_size(2 * 1024 * 1024)?;
+    sock2.set_send_buffer_size(2 * 1024 * 1024)?;
+    sock2.set_nonblocking(true)?;
+    sock2.bind(&socket2::SockAddr::from("0.0.0.0:0".parse::<SocketAddr>().unwrap()))?;
+    let socket = Arc::new(UdpSocket::from_std(sock2.into())?);
     let local_addr = socket.local_addr()?;
     tracing::info!(%local_addr, %relay_addr, "tunnel socket bound");
+
+    let (relay_tx, relay_rx) = mpsc::channel(1024);
 
     let state = Arc::new(TunnelState {
         key,
         socket,
         relay_addr,
         conns: RwLock::new(HashMap::new()),
+        relay_events: relay_tx,
         ping_seq: std::sync::atomic::AtomicU64::new(0),
         last_rtt_ms: std::sync::atomic::AtomicU64::new(0),
+        bytes_tx: std::sync::atomic::AtomicU64::new(0),
+        bytes_rx: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Spawn receiver task (reads from relay)
@@ -107,8 +106,11 @@ pub async fn run(relay_addr: SocketAddr, key: TunnelKey) -> Result<()> {
     #[cfg(windows)]
     {
         // Windows: integrate with TUN adapter
-        crate::tun_windows::run_tun(state.clone()).await?;
+        crate::tun_windows::run_tun(state.clone(), relay_rx).await?;
     }
+
+    #[cfg(not(windows))]
+    drop(relay_rx);
 
     recv_task.abort();
     ping_task.abort();
@@ -133,40 +135,60 @@ async fn recv_loop(state: Arc<TunnelState>) -> Result<()> {
         match msg {
             TunnelMessage::Connected(conn) => {
                 tracing::info!(%conn, "connection established");
-                let mut conns = state.conns.write().await;
-                if let Some(cs) = conns.get_mut(&conn) {
-                    cs.connected = true;
-                    let _ = cs.notify.send(()).await;
+                let _ = state.relay_events.try_send(RelayEvent::Connected(conn));
+                #[cfg(not(windows))]
+                {
+                    let mut conns = state.conns.write().await;
+                    if let Some(cs) = conns.get_mut(&conn) {
+                        cs.connected = true;
+                        let _ = cs.notify.send(()).await;
+                    }
                 }
             }
 
             TunnelMessage::ConnectFailed { conn, reason } => {
                 tracing::error!(%conn, %reason, "connection failed");
+                let _ = state.relay_events.try_send(RelayEvent::ConnectFailed {
+                    conn,
+                    reason: reason.clone(),
+                });
                 let mut conns = state.conns.write().await;
                 conns.remove(&conn);
             }
 
             TunnelMessage::Data { conn, payload } => {
-                let mut conns = state.conns.write().await;
-                if let Some(cs) = conns.get_mut(&conn) {
-                    cs.rx_buf.extend_from_slice(&payload);
-                    let _ = cs.notify.send(()).await;
-                } else {
-                    tracing::warn!(%conn, "data for unknown connection");
+                state.bytes_rx.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(not(windows))]
+                {
+                    let mut conns = state.conns.write().await;
+                    if let Some(cs) = conns.get_mut(&conn) {
+                        cs.rx_buf.extend_from_slice(&payload);
+                        let _ = cs.notify.send(()).await;
+                    }
                 }
+                // Move owned payload directly — no clone needed.
+                let _ = state.relay_events.try_send(RelayEvent::Data {
+                    conn,
+                    payload,
+                });
             }
 
             TunnelMessage::Shutdown(conn) => {
                 tracing::info!(%conn, "server shutdown");
-                let mut conns = state.conns.write().await;
-                if let Some(cs) = conns.get_mut(&conn) {
-                    cs.shutdown = true;
-                    let _ = cs.notify.send(()).await;
+                let _ = state.relay_events.try_send(RelayEvent::Shutdown(conn));
+                #[cfg(not(windows))]
+                {
+                    let mut conns = state.conns.write().await;
+                    if let Some(cs) = conns.get_mut(&conn) {
+                        cs.shutdown = true;
+                        let _ = cs.notify.send(()).await;
+                    }
                 }
             }
 
             TunnelMessage::Reset(conn) => {
                 tracing::info!(%conn, "server reset");
+                let _ = state.relay_events.try_send(RelayEvent::Reset(conn));
                 let mut conns = state.conns.write().await;
                 conns.remove(&conn);
             }
@@ -183,7 +205,9 @@ async fn recv_loop(state: Arc<TunnelState>) -> Result<()> {
                 state
                     .last_rtt_ms
                     .store(rtt, std::sync::atomic::Ordering::Relaxed);
-                tracing::info!(seq, rtt_ms = rtt, "pong");
+                let tx = state.bytes_tx.load(std::sync::atomic::Ordering::Relaxed);
+                let rx = state.bytes_rx.load(std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(seq, rtt_ms = rtt, bytes_tx = tx, bytes_rx = rx, "pong");
             }
 
             _ => {
@@ -254,6 +278,7 @@ pub async fn open_connection(
 
 /// Send data through an existing tunnel connection.
 pub async fn send_data(state: &Arc<TunnelState>, conn: ConnId, payload: Vec<u8>) -> Result<()> {
+    state.bytes_tx.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
     // Split into MAX_PAYLOAD_SIZE chunks
     for chunk in payload.chunks(MAX_PAYLOAD_SIZE) {
         let msg = TunnelMessage::Data {
@@ -265,7 +290,18 @@ pub async fn send_data(state: &Arc<TunnelState>, conn: ConnId, payload: Vec<u8>)
     Ok(())
 }
 
+/// Send a shutdown (FIN) for a tunnel connection.
+pub async fn send_shutdown(state: &Arc<TunnelState>, conn: ConnId) -> Result<()> {
+    send_to_relay(state, &TunnelMessage::Shutdown(conn)).await
+}
+
+/// Send a reset (RST) for a tunnel connection.
+pub async fn send_reset(state: &Arc<TunnelState>, conn: ConnId) -> Result<()> {
+    send_to_relay(state, &TunnelMessage::Reset(conn)).await
+}
+
 /// Drain received data for a connection.
+#[cfg(not(windows))]
 pub async fn drain_rx(state: &Arc<TunnelState>, conn: &ConnId) -> Vec<u8> {
     let mut conns = state.conns.write().await;
     if let Some(cs) = conns.get_mut(conn) {
@@ -276,12 +312,14 @@ pub async fn drain_rx(state: &Arc<TunnelState>, conn: &ConnId) -> Vec<u8> {
 }
 
 /// Check if connection is established.
+#[cfg(not(windows))]
 pub async fn is_connected(state: &Arc<TunnelState>, conn: &ConnId) -> bool {
     let conns = state.conns.read().await;
     conns.get(conn).is_some_and(|cs| cs.connected)
 }
 
 /// Check if server signaled shutdown.
+#[cfg(not(windows))]
 pub async fn is_shutdown(state: &Arc<TunnelState>, conn: &ConnId) -> bool {
     let conns = state.conns.read().await;
     conns.get(conn).is_some_and(|cs| cs.shutdown)
@@ -355,21 +393,3 @@ async fn test_single_connection(state: Arc<TunnelState>, dst: SocketAddr) -> Res
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_game_ip_detection() {
-        // Game server IPs should match
-        assert!(is_game_ip(Ipv4Addr::new(210, 242, 123, 135)));
-        assert!(is_game_ip(Ipv4Addr::new(210, 242, 186, 61)));
-        assert!(is_game_ip(Ipv4Addr::new(216, 107, 253, 9)));
-        assert!(is_game_ip(Ipv4Addr::new(216, 107, 244, 75)));
-
-        // Non-game IPs should not match
-        assert!(!is_game_ip(Ipv4Addr::new(8, 8, 8, 8)));
-        assert!(!is_game_ip(Ipv4Addr::new(192, 168, 1, 1)));
-        assert!(!is_game_ip(Ipv4Addr::new(210, 241, 0, 1)));
-    }
-}

@@ -3,6 +3,7 @@
 
 pub async fn run_tun(
     _state: std::sync::Arc<super::tunnel::TunnelState>,
+    _relay_rx: tokio::sync::mpsc::Receiver<super::tunnel::RelayEvent>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("TUN adapter is only supported on Windows. Use AION2_TEST_DST for testing.")
 }

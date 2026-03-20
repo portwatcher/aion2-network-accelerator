@@ -6,8 +6,14 @@
   "build": {
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": { "script": "npm run dev", "cwd": "../../ui" },
-    "beforeBuildCommand": { "script": "npm run build", "cwd": "../../ui" }
+    "beforeDevCommand": {
+      "script": "cargo build -p aion2-relay -p aion2-proxy && mkdir crates\\aion2-app\\binaries 2>nul & copy /Y target\\debug\\aion2-relay.exe crates\\aion2-app\\binaries\\aion2-relay >nul && cd ui && npm run dev",
+      "cwd": "../.."
+    },
+    "beforeBuildCommand": {
+      "script": "cargo build -p aion2-relay -p aion2-proxy --release && mkdir crates\\aion2-app\\binaries 2>nul & copy /Y target\\release\\aion2-relay.exe crates\\aion2-app\\binaries\\aion2-relay >nul & copy /Y target\\release\\aion2-proxy.exe crates\\aion2-app\\binaries\\aion2-proxy >nul && cd ui && npm run build",
+      "cwd": "../.."
+    }
   },
   "app": {
     "windows": [
@@ -40,7 +46,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["binaries/aion2-relay"],
+    "resources": ["binaries/aion2-relay", "binaries/aion2-proxy", "binaries/wintun.dll"],
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
