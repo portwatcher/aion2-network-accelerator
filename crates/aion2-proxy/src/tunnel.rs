@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
 
@@ -38,6 +39,8 @@ pub struct TunnelState {
     conns: RwLock<HashMap<ConnId, ConnState>>,
     /// Channel for relay events consumed by the TUN handler.
     relay_events: mpsc::Sender<RelayEvent>,
+    /// TCP transport: send encrypted packets to relay via TCP
+    tcp_tx: mpsc::Sender<Vec<u8>>,
     /// Stats
     ping_seq: std::sync::atomic::AtomicU64,
     pub last_rtt_ms: std::sync::atomic::AtomicU64,
@@ -46,7 +49,7 @@ pub struct TunnelState {
 }
 
 pub async fn run(relay_addr: SocketAddr, key: TunnelKey) -> Result<()> {
-    // Create UDP socket with large buffers to reduce packet loss under burst.
+    // Create UDP socket for ping/pong latency measurement
     let sock2 = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
     sock2.set_recv_buffer_size(2 * 1024 * 1024)?;
     sock2.set_send_buffer_size(2 * 1024 * 1024)?;
@@ -54,9 +57,20 @@ pub async fn run(relay_addr: SocketAddr, key: TunnelKey) -> Result<()> {
     sock2.bind(&socket2::SockAddr::from("0.0.0.0:0".parse::<SocketAddr>().unwrap()))?;
     let socket = Arc::new(UdpSocket::from_std(sock2.into())?);
     let local_addr = socket.local_addr()?;
-    tracing::info!(%local_addr, %relay_addr, "tunnel socket bound");
+    tracing::info!(%local_addr, %relay_addr, "UDP socket bound (ping/pong)");
 
-    let (relay_tx, relay_rx) = mpsc::channel(1024);
+    // Connect to relay via TCP for reliable data transport
+    tracing::info!(%relay_addr, "connecting TCP tunnel to relay...");
+    let tcp_stream = tokio::net::TcpStream::connect(relay_addr).await?;
+    tcp_stream.set_nodelay(true)?;
+    tracing::info!(%relay_addr, "TCP tunnel connected");
+
+    let (tcp_read, mut tcp_write_half) = tcp_stream.into_split();
+
+    // Channel for TCP write: proxy→relay
+    let (tcp_tx, mut tcp_rx) = mpsc::channel::<Vec<u8>>(16384);
+
+    let (relay_tx, relay_rx) = mpsc::channel(16384);
 
     let state = Arc::new(TunnelState {
         key,
@@ -64,17 +78,42 @@ pub async fn run(relay_addr: SocketAddr, key: TunnelKey) -> Result<()> {
         relay_addr,
         conns: RwLock::new(HashMap::new()),
         relay_events: relay_tx,
+        tcp_tx,
         ping_seq: std::sync::atomic::AtomicU64::new(0),
         last_rtt_ms: std::sync::atomic::AtomicU64::new(0),
         bytes_tx: std::sync::atomic::AtomicU64::new(0),
         bytes_rx: std::sync::atomic::AtomicU64::new(0),
     });
 
-    // Spawn receiver task (reads from relay)
+    // TCP write task: sends length-prefixed encrypted packets to relay
+    tokio::spawn(async move {
+        while let Some(packet) = tcp_rx.recv().await {
+            let len = (packet.len() as u32).to_be_bytes();
+            if tcp_write_half.write_all(&len).await.is_err() {
+                tracing::error!("TCP tunnel write error (length)");
+                break;
+            }
+            if tcp_write_half.write_all(&packet).await.is_err() {
+                tracing::error!("TCP tunnel write error (payload)");
+                break;
+            }
+        }
+        tracing::info!("TCP tunnel write task ended");
+    });
+
+    // TCP read task: reads length-prefixed encrypted packets from relay
+    let tcp_recv_state = state.clone();
+    let tcp_recv_task = tokio::spawn(async move {
+        if let Err(e) = tcp_recv_loop(tcp_recv_state, tcp_read).await {
+            tracing::error!("TCP recv loop error: {e}");
+        }
+    });
+
+    // UDP receiver task (for ping/pong responses only)
     let recv_state = state.clone();
     let recv_task = tokio::spawn(async move {
         if let Err(e) = recv_loop(recv_state).await {
-            tracing::error!("recv loop error: {e}");
+            tracing::error!("UDP recv loop error: {e}");
         }
     });
 
@@ -112,12 +151,38 @@ pub async fn run(relay_addr: SocketAddr, key: TunnelKey) -> Result<()> {
     #[cfg(not(windows))]
     drop(relay_rx);
 
+    tcp_recv_task.abort();
     recv_task.abort();
     ping_task.abort();
     Ok(())
 }
 
-/// Receive loop: read encrypted packets from relay, dispatch to connections.
+/// Receive loop for TCP: reads length-prefixed encrypted packets from relay.
+/// Handles all message types (reliable transport).
+async fn tcp_recv_loop(state: Arc<TunnelState>, mut tcp_read: tokio::net::tcp::OwnedReadHalf) -> Result<()> {
+    loop {
+        let mut len_buf = [0u8; 4];
+        tcp_read.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_PACKET_SIZE * 2 {
+            anyhow::bail!("frame too large from relay: {len}");
+        }
+        let mut packet = vec![0u8; len];
+        tcp_read.read_exact(&mut packet).await?;
+
+        let msg = match crypto::open(&state.key, &packet) {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::warn!("failed to decrypt relay TCP packet: {e}");
+                continue;
+            }
+        };
+
+        dispatch_relay_message(&state, msg).await;
+    }
+}
+
+/// Receive loop for UDP: now only handles Pong messages (latency measurement).
 async fn recv_loop(state: Arc<TunnelState>) -> Result<()> {
     let mut buf = vec![0u8; MAX_PACKET_SIZE];
     loop {
@@ -127,72 +192,12 @@ async fn recv_loop(state: Arc<TunnelState>) -> Result<()> {
         let msg = match crypto::open(&state.key, packet) {
             Ok(msg) => msg,
             Err(e) => {
-                tracing::warn!("failed to decrypt relay packet: {e}");
+                tracing::warn!("failed to decrypt relay UDP packet: {e}");
                 continue;
             }
         };
 
         match msg {
-            TunnelMessage::Connected(conn) => {
-                tracing::info!(%conn, "connection established");
-                let _ = state.relay_events.try_send(RelayEvent::Connected(conn));
-                #[cfg(not(windows))]
-                {
-                    let mut conns = state.conns.write().await;
-                    if let Some(cs) = conns.get_mut(&conn) {
-                        cs.connected = true;
-                        let _ = cs.notify.send(()).await;
-                    }
-                }
-            }
-
-            TunnelMessage::ConnectFailed { conn, reason } => {
-                tracing::error!(%conn, %reason, "connection failed");
-                let _ = state.relay_events.try_send(RelayEvent::ConnectFailed {
-                    conn,
-                    reason: reason.clone(),
-                });
-                let mut conns = state.conns.write().await;
-                conns.remove(&conn);
-            }
-
-            TunnelMessage::Data { conn, payload } => {
-                state.bytes_rx.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                #[cfg(not(windows))]
-                {
-                    let mut conns = state.conns.write().await;
-                    if let Some(cs) = conns.get_mut(&conn) {
-                        cs.rx_buf.extend_from_slice(&payload);
-                        let _ = cs.notify.send(()).await;
-                    }
-                }
-                // Move owned payload directly — no clone needed.
-                let _ = state.relay_events.try_send(RelayEvent::Data {
-                    conn,
-                    payload,
-                });
-            }
-
-            TunnelMessage::Shutdown(conn) => {
-                tracing::info!(%conn, "server shutdown");
-                let _ = state.relay_events.try_send(RelayEvent::Shutdown(conn));
-                #[cfg(not(windows))]
-                {
-                    let mut conns = state.conns.write().await;
-                    if let Some(cs) = conns.get_mut(&conn) {
-                        cs.shutdown = true;
-                        let _ = cs.notify.send(()).await;
-                    }
-                }
-            }
-
-            TunnelMessage::Reset(conn) => {
-                tracing::info!(%conn, "server reset");
-                let _ = state.relay_events.try_send(RelayEvent::Reset(conn));
-                let mut conns = state.conns.write().await;
-                conns.remove(&conn);
-            }
-
             TunnelMessage::Pong {
                 seq,
                 client_timestamp_ms,
@@ -209,15 +214,108 @@ async fn recv_loop(state: Arc<TunnelState>) -> Result<()> {
                 let rx = state.bytes_rx.load(std::sync::atomic::Ordering::Relaxed);
                 tracing::info!(seq, rtt_ms = rtt, bytes_tx = tx, bytes_rx = rx, "pong");
             }
-
-            _ => {
-                tracing::warn!("unexpected message from relay");
+            // If we receive non-Pong messages on UDP (shouldn't happen with TCP relay),
+            // dispatch them normally as fallback.
+            other => {
+                dispatch_relay_message(&state, other).await;
             }
         }
     }
 }
 
-/// Periodic ping to measure tunnel latency.
+/// Dispatch a decrypted relay message to the appropriate handler.
+async fn dispatch_relay_message(state: &TunnelState, msg: TunnelMessage) {
+    match msg {
+        TunnelMessage::Connected(conn) => {
+            tracing::info!(%conn, "connection established");
+            if state.relay_events.send(RelayEvent::Connected(conn)).await.is_err() {
+                tracing::error!(%conn, "relay_events channel closed (Connected)");
+            }
+            #[cfg(not(windows))]
+            {
+                let mut conns = state.conns.write().await;
+                if let Some(cs) = conns.get_mut(&conn) {
+                    cs.connected = true;
+                    let _ = cs.notify.send(()).await;
+                }
+            }
+        }
+
+        TunnelMessage::ConnectFailed { conn, reason } => {
+            tracing::error!(%conn, %reason, "connection failed");
+            if state.relay_events.send(RelayEvent::ConnectFailed {
+                conn,
+                reason: reason.clone(),
+            }).await.is_err() {
+                tracing::error!(%conn, "relay_events channel closed (ConnectFailed)");
+            }
+            let mut conns = state.conns.write().await;
+            conns.remove(&conn);
+        }
+
+        TunnelMessage::Data { conn, payload } => {
+            state.bytes_rx.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(windows))]
+            {
+                let mut conns = state.conns.write().await;
+                if let Some(cs) = conns.get_mut(&conn) {
+                    cs.rx_buf.extend_from_slice(&payload);
+                    let _ = cs.notify.send(()).await;
+                }
+            }
+            if let Err(e) = state.relay_events.try_send(RelayEvent::Data {
+                conn,
+                payload,
+            }) {
+                tracing::warn!(%conn, "relay_events channel full, dropping data ({e})");
+            }
+        }
+
+        TunnelMessage::Shutdown(conn) => {
+            tracing::info!(%conn, "server shutdown");
+            if state.relay_events.send(RelayEvent::Shutdown(conn)).await.is_err() {
+                tracing::error!(%conn, "relay_events channel closed (Shutdown)");
+            }
+            #[cfg(not(windows))]
+            {
+                let mut conns = state.conns.write().await;
+                if let Some(cs) = conns.get_mut(&conn) {
+                    cs.shutdown = true;
+                    let _ = cs.notify.send(()).await;
+                }
+            }
+        }
+
+        TunnelMessage::Reset(conn) => {
+            tracing::info!(%conn, "server reset");
+            if state.relay_events.send(RelayEvent::Reset(conn)).await.is_err() {
+                tracing::error!(%conn, "relay_events channel closed (Reset)");
+            }
+            let mut conns = state.conns.write().await;
+            conns.remove(&conn);
+        }
+
+        TunnelMessage::Pong { seq, client_timestamp_ms } => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let rtt = now_ms.saturating_sub(client_timestamp_ms);
+            state
+                .last_rtt_ms
+                .store(rtt, std::sync::atomic::Ordering::Relaxed);
+            let tx = state.bytes_tx.load(std::sync::atomic::Ordering::Relaxed);
+            let rx = state.bytes_rx.load(std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(seq, rtt_ms = rtt, bytes_tx = tx, bytes_rx = rx, "pong");
+        }
+
+        _ => {
+            tracing::warn!("unexpected message from relay");
+        }
+    }
+}
+
+/// Periodic ping to measure tunnel latency (sent via UDP for low overhead).
 async fn ping_loop(state: Arc<TunnelState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
@@ -231,14 +329,24 @@ async fn ping_loop(state: Arc<TunnelState>) {
             .as_millis() as u64;
 
         let msg = TunnelMessage::Ping { seq, timestamp_ms };
-        if let Err(e) = send_to_relay(&state, &msg).await {
+        // Send ping via UDP for lower latency measurement
+        if let Err(e) = send_to_relay_udp(&state, &msg).await {
             tracing::warn!("ping send failed: {e}");
         }
     }
 }
 
-/// Encrypt and send a message to the relay.
+/// Encrypt and send a message to the relay via TCP (reliable).
 async fn send_to_relay(state: &TunnelState, msg: &TunnelMessage) -> Result<()> {
+    let packet = crypto::seal(&state.key, msg)?;
+    if state.tcp_tx.send(packet).await.is_err() {
+        anyhow::bail!("TCP tunnel write channel closed");
+    }
+    Ok(())
+}
+
+/// Encrypt and send a message to the relay via UDP (for ping/pong).
+async fn send_to_relay_udp(state: &TunnelState, msg: &TunnelMessage) -> Result<()> {
     let packet = crypto::seal(&state.key, msg)?;
     state.socket.send_to(&packet, state.relay_addr).await?;
     Ok(())

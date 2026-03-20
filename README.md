@@ -12,8 +12,8 @@ If you play Aion2 Taiwan from Japan (or anywhere outside Taiwan), you've probabl
 
 **Aion2 Network Accelerator** solves this by:
 
-1. Capturing only game-related network traffic on your PC (everything else is unaffected)
-2. Sending it through an encrypted tunnel to a relay server you control in Taiwan
+1. Routing all TCP traffic through a TUN adapter on your PC
+2. Sending it through an encrypted TCP tunnel to a relay server you control in Taiwan
 3. The relay forwards your traffic directly to the game servers over a fast local connection
 
 The result: significantly lower ping and a smoother gameplay experience.
@@ -30,7 +30,7 @@ The result: significantly lower ping and a smoother gameplay experience.
 
 ## Screenshots
 
-*Coming soon*
+![Aion2 Network Accelerator](screenshot.png)
 
 ## Requirements
 
@@ -67,15 +67,15 @@ The result: significantly lower ping and a smoother gameplay experience.
 ```
 Your PC (Japan)                    Taiwan VPS                  Game Server
 ┌──────────────┐    encrypted     ┌──────────────┐   direct  ┌───────────┐
-│  Aion2 Proxy │ ──── UDP ──────► │  Aion2 Relay │ ── TCP ─► │  Aion2 TW │
+│  Aion2 Proxy │ ──── TCP ──────► │  Aion2 Relay │ ── TCP ─► │  Aion2 TW │
 │  (captures   │    (~40ms)       │  (forwards   │  (~2ms)   │  (HiNet)  │
-│  game traffic│ ◄── UDP ──────── │  to game)    │ ◄─ TCP ── │           │
+│  game traffic│ ◄── TCP ──────── │  to game)    │ ◄─ TCP ── │           │
 └──────────────┘                  └──────────────┘           └───────────┘
 ```
 
-The proxy captures game-bound network packets on your PC using a TUN adapter, encrypts them, and sends them via UDP to the relay server. The relay decrypts the traffic, opens a real TCP connection to the game server, and forwards it. Responses travel the same path in reverse.
+The proxy captures game-bound network packets on your PC using a TUN adapter, encrypts them, and sends them via a TCP tunnel to the relay server. The relay decrypts the traffic, opens a real TCP connection to the game server, and forwards it. Responses travel the same path in reverse.
 
-Only traffic to game server IPs (`210.242.0.0/16`, `216.107.244.0/24`, `216.107.253.0/24`) is routed through the tunnel — all other internet traffic goes through your normal connection.
+All public IP traffic is routed through the tunnel (full-tunnel mode). Private networks (LAN) and the relay server IP are excluded.
 
 ## Project Structure
 
@@ -145,8 +145,8 @@ AION2_TEST_DST=210.242.123.135:13328 cargo run -p aion2-proxy -- \
 | Crate | Purpose |
 |-------|---------|
 | `aion2-common` | Tunnel packet format (`TunnelMessage` enum), XChaCha20-Poly1305 encryption, bincode framing |
-| `aion2-relay` | Multi-user UDP→TCP forwarder daemon — receives encrypted UDP, opens real TCP to game, relays responses. Supports hot-reload via SIGHUP |
-| `aion2-proxy` | Client engine — creates TUN adapter (wintun on Windows), parses IP packets with smoltcp, encrypts and tunnels to relay |
+| `aion2-relay` | Multi-user TCP tunnel forwarder daemon — receives encrypted tunnel traffic, opens real TCP to game, relays responses. Supports hot-reload via SIGHUP |
+| `aion2-proxy` | Client engine — creates TUN adapter (wintun on Windows), implements userspace TCP stack, encrypts and tunnels to relay over TCP |
 | `aion2-app` | Tauri 2 shell — IPC commands for start/stop/status, SSH deploy logic, connection profile management |
 | `ui/` | Vue 3 frontend — dashboard with real-time stats, deploy wizard, profile management, log viewer |
 
@@ -157,6 +157,6 @@ This project is licensed under the [MIT License](LICENSE).
 ## Acknowledgments
 
 - [Tauri](https://tauri.app/) — Desktop app framework
-- [smoltcp](https://github.com/smoltcp-rs/smoltcp) — Userspace TCP/IP stack
+- [wintun-bindings](https://crates.io/crates/wintun) — Rust bindings for wintun
 - [wintun](https://www.wintun.net/) — Windows TUN adapter
 - [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) — Cross-compilation toolchain

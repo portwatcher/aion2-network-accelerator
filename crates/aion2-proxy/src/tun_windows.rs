@@ -52,6 +52,11 @@ struct NatEntry {
     pending_data: Vec<Vec<u8>>,
     /// Whether the relay has confirmed the connection.
     tunnel_connected: bool,
+    /// Byte/message counters for diagnostics.
+    bytes_to_relay: u64,
+    msgs_to_relay: u64,
+    bytes_from_relay: u64,
+    msgs_from_relay: u64,
 }
 
 #[cfg(windows)]
@@ -98,10 +103,10 @@ pub async fn run_tun(
     let nat_table: NatTable = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // Channel: constructed packets → TUN write thread
-    let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Vec<u8>>(512);
+    let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     // Channel: TUN read thread → main loop
-    let (tun_read_tx, mut tun_read_rx) = mpsc::channel::<Vec<u8>>(512);
+    let (tun_read_tx, mut tun_read_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     // Thread: read raw packets from TUN adapter
     let read_session = session.clone();
@@ -165,7 +170,14 @@ pub async fn run_tun(
                 table.retain(|conn, entry| {
                     if let NatState::Closing(since) = entry.state {
                         if now.duration_since(since).as_secs() >= 5 {
-                            tracing::debug!(%conn, "cleaning up stale Closing entry");
+                            tracing::debug!(
+                                %conn,
+                                bytes_to_relay = entry.bytes_to_relay,
+                                msgs_to_relay = entry.msgs_to_relay,
+                                bytes_from_relay = entry.bytes_from_relay,
+                                msgs_from_relay = entry.msgs_from_relay,
+                                "cleaning up stale Closing entry"
+                            );
                             return false;
                         }
                     }
@@ -239,6 +251,10 @@ async fn handle_tun_packet(
             state: NatState::SynReceived,
             pending_data: Vec::new(),
             tunnel_connected: false,
+            bytes_to_relay: 0,
+            msgs_to_relay: 0,
+            bytes_from_relay: 0,
+            msgs_from_relay: 0,
         };
         nat_table.lock().await.insert(conn, entry);
 
@@ -282,9 +298,52 @@ async fn handle_tun_packet(
 
                 let is_closing = matches!(entry.state, NatState::Closing(_));
 
-                if !payload.is_empty() && !is_closing {
-                    entry.client_next_seq = seq.wrapping_add(payload.len() as u32);
+                if !payload.is_empty() {
+                    if seq == entry.client_next_seq {
+                        // New data — advance seq and forward
+                        entry.client_next_seq = seq.wrapping_add(payload.len() as u32);
 
+                        ack_pkt = Some(build_tcp_packet(
+                            entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
+                            entry.our_next_seq,
+                            entry.client_next_seq,
+                            TCP_ACK,
+                            65535,
+                            &[],
+                            false,
+                        ));
+
+                        if !is_closing {
+                            if entry.tunnel_connected {
+                                entry.bytes_to_relay += payload.len() as u64;
+                                entry.msgs_to_relay += 1;
+                                data_to_send = Some(payload.to_vec());
+                            } else {
+                                entry.pending_data.push(payload.to_vec());
+                            }
+                        }
+                    } else {
+                        // Retransmit or out-of-order — ACK with current state but don't forward
+                        tracing::debug!(
+                            %conn,
+                            pkt_seq = seq,
+                            expected_seq = entry.client_next_seq,
+                            payload_len = payload.len(),
+                            "seq mismatch (retransmit/keepalive)"
+                        );
+                        ack_pkt = Some(build_tcp_packet(
+                            entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
+                            entry.our_next_seq,
+                            entry.client_next_seq,
+                            TCP_ACK,
+                            65535,
+                            &[],
+                            false,
+                        ));
+                    }
+                } else if ack && !fin && seq != entry.client_next_seq {
+                    // TCP keepalive probe: empty ACK with seq = expected - 1.
+                    // Must respond with ACK so the OS knows the connection is alive.
                     ack_pkt = Some(build_tcp_packet(
                         entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
                         entry.our_next_seq,
@@ -294,28 +353,47 @@ async fn handle_tun_packet(
                         &[],
                         false,
                     ));
-
-                    if entry.tunnel_connected {
-                        data_to_send = Some(payload.to_vec());
-                    } else {
-                        entry.pending_data.push(payload.to_vec());
-                    }
                 }
 
                 if fin {
+                    let bt = entry.bytes_to_relay;
+                    let mt = entry.msgs_to_relay;
+                    let bf = entry.bytes_from_relay;
+                    let mf = entry.msgs_from_relay;
+                    tracing::info!(
+                        %conn,
+                        bytes_to_relay = bt,
+                        msgs_to_relay = mt,
+                        bytes_from_relay = bf,
+                        msgs_from_relay = mf,
+                        "connection closing (FIN)"
+                    );
                     entry.client_next_seq = entry.client_next_seq.wrapping_add(1);
 
-                    fin_ack_pkt = Some(build_tcp_packet(
-                        entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
-                        entry.our_next_seq,
-                        entry.client_next_seq,
-                        TCP_FIN | TCP_ACK,
-                        65535,
-                        &[],
-                        false,
-                    ));
-                    entry.our_next_seq = entry.our_next_seq.wrapping_add(1);
-                    if !is_closing {
+                    if is_closing {
+                        // We already sent FIN (Closing). Client FIN completes the close.
+                        // Send just ACK — don't send another FIN.
+                        fin_ack_pkt = Some(build_tcp_packet(
+                            entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
+                            entry.our_next_seq,
+                            entry.client_next_seq,
+                            TCP_ACK,
+                            65535,
+                            &[],
+                            false,
+                        ));
+                    } else {
+                        // Client initiated close. Send FIN|ACK.
+                        fin_ack_pkt = Some(build_tcp_packet(
+                            entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
+                            entry.our_next_seq,
+                            entry.client_next_seq,
+                            TCP_FIN | TCP_ACK,
+                            65535,
+                            &[],
+                            false,
+                        ));
+                        entry.our_next_seq = entry.our_next_seq.wrapping_add(1);
                         do_shutdown = true;
                     }
                     do_remove = true;
@@ -330,7 +408,9 @@ async fn handle_tun_packet(
             let _ = tun_write_tx.send(pkt).await;
         }
         if let Some(data) = data_to_send {
-            let _ = tunnel::send_data(state, conn, data).await;
+            if let Err(e) = tunnel::send_data(state, conn, data).await {
+                tracing::warn!(%conn, "tunnel send_data error: {e}");
+            }
         }
         if let Some(pkt) = fin_ack_pkt {
             let _ = tun_write_tx.send(pkt).await;
@@ -355,12 +435,22 @@ async fn handle_relay_event(
             if let Some(entry) = table.get_mut(&conn) {
                 entry.tunnel_connected = true;
                 let pending: Vec<Vec<u8>> = std::mem::take(&mut entry.pending_data);
+                let pending_bytes: u64 = pending.iter().map(|d| d.len() as u64).sum();
+                let pending_msgs = pending.len() as u64;
                 drop(table);
                 // Flush any data that arrived before relay connected
-                for data in pending {
-                    let _ = tunnel::send_data(state, conn, data).await;
+                for data in &pending {
+                    let _ = tunnel::send_data(state, conn, data.clone()).await;
                 }
-                tracing::debug!(%conn, "tunnel connected, flushed pending data");
+                // Account for pending data in counters
+                if pending_msgs > 0 {
+                    let mut table = nat_table.lock().await;
+                    if let Some(entry) = table.get_mut(&conn) {
+                        entry.bytes_to_relay += pending_bytes;
+                        entry.msgs_to_relay += pending_msgs;
+                    }
+                }
+                tracing::info!(%conn, pending_msgs, "connection established");
             }
         }
 
@@ -384,6 +474,8 @@ async fn handle_relay_event(
         RelayEvent::Data { conn, payload } => {
             let mut table = nat_table.lock().await;
             if let Some(entry) = table.get_mut(&conn) {
+                entry.bytes_from_relay += payload.len() as u64;
+                entry.msgs_from_relay += 1;
                 // Deliver data from the relay to the OS in MSS-sized segments
                 for chunk in payload.chunks(1400) {
                     let data_pkt = build_tcp_packet(
@@ -404,6 +496,14 @@ async fn handle_relay_event(
         RelayEvent::Shutdown(conn) => {
             let mut table = nat_table.lock().await;
             if let Some(entry) = table.get_mut(&conn) {
+                tracing::info!(
+                    %conn,
+                    bytes_to_relay = entry.bytes_to_relay,
+                    msgs_to_relay = entry.msgs_to_relay,
+                    bytes_from_relay = entry.bytes_from_relay,
+                    msgs_from_relay = entry.msgs_from_relay,
+                    "server shutdown"
+                );
                 let fin = build_tcp_packet(
                     entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
                     entry.our_next_seq,
@@ -417,13 +517,21 @@ async fn handle_relay_event(
                 entry.state = NatState::Closing(Instant::now());
                 drop(table);
                 let _ = tun_write_tx.send(fin).await;
-                tracing::debug!(%conn, "relay shutdown, sent FIN to OS (entry→Closing)");
+
             }
         }
 
         RelayEvent::Reset(conn) => {
             let mut table = nat_table.lock().await;
             if let Some(entry) = table.remove(&conn) {
+                tracing::info!(
+                    %conn,
+                    bytes_to_relay = entry.bytes_to_relay,
+                    msgs_to_relay = entry.msgs_to_relay,
+                    bytes_from_relay = entry.bytes_from_relay,
+                    msgs_from_relay = entry.msgs_from_relay,
+                    "server reset"
+                );
                 let rst = build_tcp_packet(
                     entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
                     entry.our_next_seq,
