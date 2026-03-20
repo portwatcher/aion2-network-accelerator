@@ -59,18 +59,11 @@
     "longDescription": "Routes Aion2 Taiwan game traffic through a Taiwan relay VPS to bypass geo-blocking with minimal latency.",
     "copyright": "",
     "category": "Utility",
-    "createUpdaterArtifacts": "v1Compatible"
+    "createUpdaterArtifacts": false
   },
   "plugins": {
     "shell": {
       "open": true
-    },
-    "updater": {
-      "pubkey": "",
-      "endpoints": [],
-      "windows": {
-        "installMode": "passive"
-      }
     }
   }
 }
