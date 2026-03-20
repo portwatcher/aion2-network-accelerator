@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "aion2-proxy", about = "Aion2 game traffic proxy client")]
 struct Args {
     /// Relay server address (UDP)
-    #[arg(short, long, default_value = "130.94.37.247:443")]
+    #[arg(short, long)]
     relay: SocketAddr,
 
     /// Path to shared key file (64 hex characters)
@@ -32,7 +32,18 @@ async fn main() -> Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
         .init();
+
+    // Check for admin privileges on Windows (required for TUN adapter)
+    #[cfg(windows)]
+    {
+        if !is_elevated() {
+            anyhow::bail!("Administrator privileges required. Please run as Administrator.");
+        }
+        tracing::info!("running with administrator privileges");
+    }
 
     let args = Args::parse();
 
@@ -57,4 +68,35 @@ fn hex_decode(hex: &str) -> Result<[u8; 32]> {
             .map_err(|e| anyhow::anyhow!("invalid hex at position {}: {e}", i * 2))?;
     }
     Ok(out)
+}
+
+/// Check if the current process has administrator privileges.
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    use std::mem;
+    use std::ptr;
+
+    unsafe {
+        let mut token: winapi::shared::ntdef::HANDLE = ptr::null_mut();
+        if winapi::um::processthreadsapi::OpenProcessToken(
+            winapi::um::processthreadsapi::GetCurrentProcess(),
+            winapi::um::winnt::TOKEN_QUERY,
+            &mut token,
+        ) == 0
+        {
+            return false;
+        }
+
+        let mut elevation: winapi::um::winnt::TOKEN_ELEVATION = mem::zeroed();
+        let mut size: u32 = 0;
+        let ok = winapi::um::securitybaseapi::GetTokenInformation(
+            token,
+            winapi::um::winnt::TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            mem::size_of::<winapi::um::winnt::TOKEN_ELEVATION>() as u32,
+            &mut size,
+        );
+        winapi::um::handleapi::CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
 }

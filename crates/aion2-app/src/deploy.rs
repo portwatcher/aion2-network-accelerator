@@ -50,7 +50,19 @@ fn emit_progress(app: &AppHandle, msg: impl Into<String>) {
 }
 
 fn find_relay_binary(app: &AppHandle) -> Result<Vec<u8>, String> {
-    // Try bundled resource (distributed app)
+    // Prefer cross-compiled Linux musl binary (dev workspace)
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent());
+
+    if let Some(ws) = workspace {
+        let musl_path = ws.join("target/x86_64-unknown-linux-musl/release/aion2-relay");
+        if let Ok(data) = std::fs::read(&musl_path) {
+            return Ok(data);
+        }
+    }
+
+    // Fallback: bundled resource (distributed app — CI builds the correct Linux binary)
     if let Ok(resource_dir) = app.path().resource_dir() {
         let bundled = resource_dir.join("binaries/aion2-relay");
         if let Ok(data) = std::fs::read(&bundled) {
@@ -58,20 +70,13 @@ fn find_relay_binary(app: &AppHandle) -> Result<Vec<u8>, String> {
         }
     }
 
-    // Fallback: dev workspace path
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or("Cannot determine workspace root")?;
+    let hint = workspace
+        .map(|ws| ws.join("target/x86_64-unknown-linux-musl/release/aion2-relay").display().to_string())
+        .unwrap_or_else(|| "<workspace>/target/x86_64-unknown-linux-musl/release/aion2-relay".into());
 
-    let musl_path = workspace.join("target/x86_64-unknown-linux-musl/release/aion2-relay");
-
-    std::fs::read(&musl_path).map_err(|_| {
-        format!(
-            "Relay binary not found at {}\nRun: cargo zigbuild --release --target x86_64-unknown-linux-musl -p aion2-relay",
-            musl_path.display()
-        )
-    })
+    Err(format!(
+        "Linux relay binary not found.\nRun: cargo zigbuild --release --target x86_64-unknown-linux-musl -p aion2-relay\nExpected at: {hint}"
+    ))
 }
 
 fn ssh_connect(host: &str, port: u16, user: &str, password: &str) -> Result<Session, String> {

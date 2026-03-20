@@ -1,12 +1,9 @@
-use aion2_common::crypto::{self, TunnelKey};
-use aion2_common::protocol::{TunnelMessage, MAX_PACKET_SIZE};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 /// Config received from the frontend.
@@ -43,6 +40,8 @@ pub struct ProxyState {
 struct RunningProxy {
     cancel: tokio::sync::watch::Sender<bool>,
     stats: Arc<ProxyStats>,
+    key_file: PathBuf,
+    child_pid: u32,
 }
 
 struct ProxyStats {
@@ -102,6 +101,171 @@ fn hex_decode(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Kill a process by PID.
+fn kill_process(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output();
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+    }
+}
+
+/// Locate the aion2-proxy binary.
+/// Also ensures wintun.dll is present next to it on Windows.
+fn find_proxy_binary() -> Result<PathBuf, String> {
+    let name = if cfg!(windows) {
+        "aion2-proxy.exe"
+    } else {
+        "aion2-proxy"
+    };
+
+    let proxy_path;
+
+    // Dev mode: look in target/debug relative to manifest dir
+    #[cfg(debug_assertions)]
+    {
+        let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug")
+            .join(name);
+        if dev_path.exists() {
+            proxy_path = dev_path;
+        } else {
+            return Err("aion2-proxy binary not found. Run: cargo build -p aion2-proxy".into());
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        // Production: look next to the application exe, and in binaries/ subdir
+        proxy_path = find_near_exe(name)?;
+    }
+
+    // Ensure wintun.dll is next to the proxy binary
+    #[cfg(windows)]
+    {
+        if let Some(proxy_dir) = proxy_path.parent() {
+            let wintun_dst = proxy_dir.join("wintun.dll");
+            if !wintun_dst.exists() {
+                // Try to find wintun.dll in known locations and copy it
+                let search_paths: Vec<PathBuf> = vec![
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries/wintun.dll"),
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../wintun.dll"),
+                ];
+                let mut found = false;
+                for src in &search_paths {
+                    if src.exists() {
+                        if std::fs::copy(src, &wintun_dst).is_ok() {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if !found {
+                    return Err(
+                        "wintun.dll not found. Download from https://www.wintun.net/builds/wintun-0.14.1.zip \
+                        and place wintun.dll (from bin/amd64/) into the project root or crates/aion2-app/binaries/"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(proxy_path)
+}
+
+#[cfg(not(debug_assertions))]
+fn find_near_exe(name: &str) -> Result<PathBuf, String> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let proxy = dir.join(name);
+            if proxy.exists() {
+                return Ok(proxy);
+            }
+            let proxy = dir.join("binaries").join(name);
+            if proxy.exists() {
+                return Ok(proxy);
+            }
+        }
+    }
+    Err("aion2-proxy binary not found".into())
+}
+
+/// Parse a log line from the proxy process to update stats.
+fn parse_proxy_line(stats: &ProxyStats, line: &str) {
+    // Parse RTT and byte counters from pong lines:
+    //   "...rtt_ms=42...bytes_tx=1234...bytes_rx=5678..."
+    if line.contains("pong") {
+        if let Some(rtt_part) = line.split("rtt_ms").nth(1) {
+            // Skip '=' and optional spaces
+            let digits: String = rtt_part
+                .chars()
+                .skip_while(|c| *c == '=' || *c == ' ')
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(rtt) = digits.parse::<u64>() {
+                stats.rtt_ms.store(rtt, Ordering::Relaxed);
+                stats.connected.store(true, Ordering::Relaxed);
+            }
+        }
+        // Parse bytes_tx
+        if let Some(part) = line.split("bytes_tx").nth(1) {
+            let digits: String = part
+                .chars()
+                .skip_while(|c| *c == '=' || *c == ' ')
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(v) = digits.parse::<u64>() {
+                stats.bytes_tx.store(v, Ordering::Relaxed);
+            }
+        }
+        // Parse bytes_rx
+        if let Some(part) = line.split("bytes_rx").nth(1) {
+            let digits: String = part
+                .chars()
+                .skip_while(|c| *c == '=' || *c == ' ')
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(v) = digits.parse::<u64>() {
+                stats.bytes_rx.store(v, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Track active connections
+    if line.contains("connection established") || line.contains("SYN captured") {
+        stats.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+    if line.contains("server closed")
+        || line.contains("server shutdown")
+        || line.contains("server reset")
+    {
+        let prev = stats.active_connections.load(Ordering::Relaxed);
+        if prev > 0 {
+            stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Strip the tracing prefix (timestamp + level + module) for cleaner display.
+fn strip_tracing_prefix(line: &str) -> &str {
+    for keyword in &["INFO ", "WARN ", "ERROR ", "DEBUG "] {
+        if let Some(kw_pos) = line.find(keyword) {
+            let after_kw = &line[kw_pos + keyword.len()..];
+            if let Some(colon_pos) = after_kw.find(": ") {
+                return &after_kw[colon_pos + 2..];
+            }
+            return after_kw;
+        }
+    }
+    line
+}
+
 #[tauri::command]
 pub async fn start_proxy(
     app: AppHandle,
@@ -113,16 +277,47 @@ pub async fn start_proxy(
     // Stop existing if running
     if let Some(running) = lock.take() {
         let _ = running.cancel.send(true);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = std::fs::remove_file(&running.key_file);
+        kill_process(running.child_pid);
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    let relay_addr: SocketAddr = config
-        .relay_addr
-        .parse()
-        .map_err(|e| format!("Invalid relay address: {e}"))?;
+    // Validate key format
+    hex_decode(config.key_hex.trim())?;
 
-    let key_bytes = hex_decode(config.key_hex.trim())?;
-    let key = TunnelKey::from_bytes(&key_bytes);
+    // Find the proxy binary
+    let proxy_bin = find_proxy_binary()?;
+    emit_log(
+        &app,
+        "info",
+        format!("Found proxy: {}", proxy_bin.display()),
+    );
+
+    // Write key to a temp file for the proxy binary to read
+    let key_file = std::env::temp_dir().join("aion2_tunnel.key");
+    std::fs::write(&key_file, config.key_hex.trim())
+        .map_err(|e| format!("Failed to write key file: {e}"))?;
+
+    emit_log(
+        &app,
+        "info",
+        format!("Connecting to relay {}...", config.relay_addr),
+    );
+
+    // Spawn the proxy process
+    let mut child = std::process::Command::new(&proxy_bin)
+        .args([
+            "--relay",
+            &config.relay_addr,
+            "--key",
+            &key_file.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start proxy: {e}"))?;
+
+    let child_pid = child.id();
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let stats = Arc::new(ProxyStats {
@@ -134,32 +329,109 @@ pub async fn start_proxy(
         started_at: std::time::Instant::now(),
     });
 
-    emit_log(&app, "info", format!("Connecting to relay {relay_addr}..."));
-
-    // Spawn the tunnel tasks
-    let app_handle = app.clone();
-    let stats_clone = stats.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_tunnel(app_handle.clone(), relay_addr, key, stats_clone, cancel_rx).await {
-            emit_log(&app_handle, "error", format!("Tunnel error: {e}"));
+    // Read stderr on a blocking thread (reliable on Windows piped handles)
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(128);
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if line_tx.blocking_send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
     });
 
-    // Spawn status emitter
+    // Process lines from stderr and emit as logs
+    let log_app = app.clone();
+    let log_stats = stats.clone();
+    let mut log_cancel = cancel_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                line = line_rx.recv() => {
+                    match line {
+                        Some(line) => {
+                            parse_proxy_line(&log_stats, &line);
+                            let level = if line.contains("ERROR") {
+                                "error"
+                            } else if line.contains("WARN") {
+                                "warn"
+                            } else {
+                                "info"
+                            };
+                            let msg = strip_tracing_prefix(&line);
+                            emit_log(&log_app, level, msg);
+                        }
+                        None => {
+                            log_stats.connected.store(false, Ordering::Relaxed);
+                            emit_log(&log_app, "warn", "Proxy process exited");
+                            break;
+                        }
+                    }
+                }
+                _ = log_cancel.changed() => break,
+            }
+        }
+    });
+
+    // Wait for process exit in background
+    let exit_app = app.clone();
+    let exit_stats = stats.clone();
+    let mut exit_cancel = cancel_rx.clone();
+    tokio::spawn(async move {
+        let result = tokio::select! {
+            r = tokio::task::spawn_blocking(move || child.wait()) => r,
+            _ = exit_cancel.changed() => {
+                // Stop requested — kill is handled below
+                return;
+            }
+        };
+        match result {
+            Ok(Ok(status)) => {
+                emit_log(
+                    &exit_app,
+                    if status.success() { "info" } else { "error" },
+                    format!("Proxy exited: {status}"),
+                );
+            }
+            Ok(Err(e)) => {
+                emit_log(&exit_app, "error", format!("Proxy wait error: {e}"));
+            }
+            Err(e) => {
+                emit_log(&exit_app, "error", format!("Proxy task error: {e}"));
+            }
+        }
+        exit_stats.connected.store(false, Ordering::Relaxed);
+    });
+
+    // Emit status updates to frontend every second
     let status_app = app.clone();
     let status_stats = stats.clone();
+    let mut status_cancel = cancel_rx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
-            interval.tick().await;
-            let s = build_status(&status_stats);
-            let _ = status_app.emit("proxy-status", &s);
+            tokio::select! {
+                _ = interval.tick() => {
+                    let s = build_status(&status_stats);
+                    let _ = status_app.emit("proxy-status", &s);
+                }
+                _ = status_cancel.changed() => break,
+            }
         }
     });
 
     *lock = Some(RunningProxy {
         cancel: cancel_tx,
         stats,
+        key_file,
+        child_pid,
     });
 
     Ok(())
@@ -173,6 +445,9 @@ pub async fn stop_proxy(
     let mut lock = state.inner.lock().await;
     if let Some(running) = lock.take() {
         let _ = running.cancel.send(true);
+        let _ = std::fs::remove_file(&running.key_file);
+        // Kill the proxy process
+        kill_process(running.child_pid);
         emit_log(&app, "info", "Proxy stopped");
     }
     Ok(())
@@ -207,145 +482,5 @@ fn build_status(stats: &ProxyStats) -> ProxyStatus {
         bytes_tx: stats.bytes_tx.load(Ordering::Relaxed),
         bytes_rx: stats.bytes_rx.load(Ordering::Relaxed),
         active_connections: stats.active_connections.load(Ordering::Relaxed) as u32,
-    }
-}
-
-/// Run the UDP tunnel (ping/pong + receive loop).
-async fn run_tunnel(
-    app: AppHandle,
-    relay_addr: SocketAddr,
-    key: TunnelKey,
-    stats: Arc<ProxyStats>,
-    mut cancel: tokio::sync::watch::Receiver<bool>,
-) -> Result<(), String> {
-    let socket = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| format!("Failed to bind socket: {e}"))?,
-    );
-
-    let local = socket.local_addr().map_err(|e| e.to_string())?;
-    emit_log(
-        &app,
-        "info",
-        format!("Tunnel bound on {local}, relay: {relay_addr}"),
-    );
-
-    // Ping loop
-    let ping_socket = socket.clone();
-    let ping_key = key.clone();
-    let ping_stats = stats.clone();
-    let ping_app = app.clone();
-    let mut ping_cancel = cancel.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        let mut seq: u64 = 0;
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                _ = ping_cancel.changed() => break,
-            }
-
-            let timestamp_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-
-            let msg = TunnelMessage::Ping {
-                seq,
-                timestamp_ms,
-            };
-            match crypto::seal(&ping_key, &msg) {
-                Ok(packet) => {
-                    ping_stats
-                        .bytes_tx
-                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
-                    if let Err(e) = ping_socket.send_to(&packet, relay_addr).await {
-                        emit_log(&ping_app, "warn", format!("Ping send failed: {e}"));
-                    }
-                }
-                Err(e) => {
-                    emit_log(&ping_app, "error", format!("Ping encrypt failed: {e}"));
-                }
-            }
-            seq += 1;
-        }
-    });
-
-    // Receive loop
-    let mut buf = vec![0u8; MAX_PACKET_SIZE];
-    loop {
-        tokio::select! {
-            result = socket.recv_from(&mut buf) => {
-                match result {
-                    Ok((len, _peer)) => {
-                        stats.bytes_rx.fetch_add(len as u64, Ordering::Relaxed);
-                        let packet = &buf[..len];
-                        match crypto::open(&key, packet) {
-                            Ok(msg) => handle_relay_msg(&app, &stats, msg),
-                            Err(e) => {
-                                emit_log(&app, "warn", format!("Decrypt failed: {e}"));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        emit_log(&app, "error", format!("Recv error: {e}"));
-                        break;
-                    }
-                }
-            }
-            _ = cancel.changed() => {
-                emit_log(&app, "info", "Tunnel shutting down");
-                break;
-            }
-        }
-    }
-
-    stats.connected.store(false, Ordering::Relaxed);
-    Ok(())
-}
-
-fn handle_relay_msg(app: &AppHandle, stats: &ProxyStats, msg: TunnelMessage) {
-    match msg {
-        TunnelMessage::Pong {
-            seq,
-            client_timestamp_ms,
-        } => {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            let rtt = now_ms.saturating_sub(client_timestamp_ms);
-            stats.rtt_ms.store(rtt, Ordering::Relaxed);
-            stats.connected.store(true, Ordering::Relaxed);
-            emit_log(app, "info", format!("Pong seq={seq} rtt={rtt}ms"));
-        }
-        TunnelMessage::Connected(conn) => {
-            stats
-                .active_connections
-                .fetch_add(1, Ordering::Relaxed);
-            emit_log(app, "info", format!("Connection established: {conn}"));
-        }
-        TunnelMessage::ConnectFailed { conn, reason } => {
-            emit_log(app, "error", format!("Connect failed {conn}: {reason}"));
-        }
-        TunnelMessage::Shutdown(conn) => {
-            stats
-                .active_connections
-                .fetch_sub(1, Ordering::Relaxed);
-            emit_log(app, "info", format!("Connection closed: {conn}"));
-        }
-        TunnelMessage::Reset(conn) => {
-            stats
-                .active_connections
-                .fetch_sub(1, Ordering::Relaxed);
-            emit_log(app, "warn", format!("Connection reset: {conn}"));
-        }
-        TunnelMessage::Data { payload, .. } => {
-            stats
-                .bytes_rx
-                .fetch_add(payload.len() as u64, Ordering::Relaxed);
-        }
-        _ => {}
     }
 }

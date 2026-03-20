@@ -60,8 +60,9 @@ impl TunnelKey {
         (key_bytes, key)
     }
 
-    /// Encrypt plaintext. Returns `nonce || ciphertext || tag`.
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    /// Encrypt plaintext directly into a caller-provided buffer.
+    /// Appends `nonce || ciphertext || tag` to `out`.
+    pub fn encrypt_into(&self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<()> {
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
@@ -71,10 +72,16 @@ impl TunnelKey {
             .encrypt(nonce, plaintext)
             .map_err(|e| anyhow!("encryption failed: {e}"))?;
 
-        let mut packet = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
-        packet.extend_from_slice(&nonce_bytes);
-        packet.extend_from_slice(&ciphertext);
-        Ok(packet)
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(())
+    }
+
+    /// Encrypt plaintext. Returns `nonce || ciphertext || tag`.
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(NONCE_SIZE + plaintext.len() + TAG_SIZE);
+        self.encrypt_into(plaintext, &mut out)?;
+        Ok(out)
     }
 
     /// Decrypt a packet produced by `encrypt`. Input is `nonce || ciphertext || tag`.
@@ -100,10 +107,10 @@ impl TunnelKey {
 /// Wire format: `key_id (4B) || nonce (24B) || ciphertext || tag (16B)`
 pub fn seal(key: &TunnelKey, msg: &crate::protocol::TunnelMessage) -> Result<Vec<u8>> {
     let plaintext = crate::protocol::encode_message(msg)?;
-    let encrypted = key.encrypt(&plaintext)?;
-    let mut packet = Vec::with_capacity(KEY_ID_SIZE + encrypted.len());
+    // Single allocation: key_id + nonce + ciphertext + tag
+    let mut packet = Vec::with_capacity(KEY_ID_SIZE + NONCE_SIZE + plaintext.len() + TAG_SIZE);
     packet.extend_from_slice(&key.key_id);
-    packet.extend_from_slice(&encrypted);
+    key.encrypt_into(&plaintext, &mut packet)?;
     Ok(packet)
 }
 
