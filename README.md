@@ -152,7 +152,7 @@ AION2_TEST_DST=210.242.123.135:13328 cargo run -p aion2-proxy -- \
 
 ## License
 
-*To be determined*
+This project is licensed under the [MIT License](LICENSE).
 
 ## Acknowledgments
 
