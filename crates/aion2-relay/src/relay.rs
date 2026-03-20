@@ -6,13 +6,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 /// State for a single proxied TCP connection.
-#[allow(dead_code)]
 struct TcpConn {
-    /// Direct handle to the TCP write half (no intermediate channel).
-    writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    /// Send data to the TCP write half.
+    tx: mpsc::Sender<Vec<u8>>,
+    /// Send shutdown signal.
+    shutdown_tx: mpsc::Sender<()>,
     /// Which user owns this connection (for routing responses).
     key_id: KeyId,
 }
@@ -200,26 +201,18 @@ async fn handle_message(state: Arc<RelayState>, msg: TunnelMessage, key_id: KeyI
         }
 
         TunnelMessage::Data { conn, payload } => {
-            let writer = {
-                let conns = state.conns.read().await;
-                conns.get(&conn).map(|tcp| Arc::clone(&tcp.writer))
-            };
-            if let Some(writer) = writer {
-                let mut w = writer.lock().await;
-                if let Err(e) = w.write_all(&payload).await {
-                    tracing::warn!(%conn, "TCP write error: {e}");
+            let conns = state.conns.read().await;
+            if let Some(tcp) = conns.get(&conn) {
+                if tcp.tx.try_send(payload).is_err() {
+                    tracing::warn!(%conn, "TCP write channel full or closed");
                 }
             }
         }
 
         TunnelMessage::Shutdown(conn) => {
-            let writer = {
-                let conns = state.conns.read().await;
-                conns.get(&conn).map(|tcp| Arc::clone(&tcp.writer))
-            };
-            if let Some(writer) = writer {
-                let mut w = writer.lock().await;
-                let _ = w.shutdown().await;
+            let conns = state.conns.read().await;
+            if let Some(tcp) = conns.get(&conn) {
+                let _ = tcp.shutdown_tx.try_send(());
             }
         }
 
@@ -273,16 +266,46 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
         }
     };
 
-    let (mut tcp_read, tcp_write) = tcp_stream.into_split();
-    let writer = Arc::new(tokio::sync::Mutex::new(tcp_write));
+    let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
-    // Register the connection (writer accessible directly from main loop)
+    // Channel for data from tunnel → TCP write
+    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(256);
+    // Channel for shutdown signal
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+    // Register the connection
     {
         let mut conns = state.conns.write().await;
-        conns.insert(conn, TcpConn { writer, key_id });
+        conns.insert(conn, TcpConn { tx: data_tx, shutdown_tx, key_id });
     }
 
-    // Single task: TCP read → tunnel (game server → user)
+    // Task: tunnel → TCP (write to game server)
+    let write_state = state.clone();
+    let write_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                data = data_rx.recv() => {
+                    match data {
+                        Some(payload) => {
+                            if let Err(e) = tcp_write.write_all(&payload).await {
+                                tracing::warn!(%conn, "TCP write error: {e}");
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    let _ = tcp_write.shutdown().await;
+                    break;
+                }
+            }
+        }
+        let mut conns = write_state.conns.write().await;
+        conns.remove(&conn);
+    });
+
+    // Task: TCP read → tunnel (read from game server, send to user)
     let read_state = state.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; aion2_common::protocol::MAX_PAYLOAD_SIZE];
@@ -307,7 +330,7 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
                 }
             }
         }
-        // Clean up: remove connection (drops writer → sends FIN)
+        write_task.abort();
         let mut conns = read_state.conns.write().await;
         conns.remove(&conn);
     });

@@ -85,7 +85,7 @@ jobs:
         with:
           projectPath: crates/aion2-app
           tauriScript: npx --prefix ../../ui tauri
-          args: --config "{\"build\":{\"beforeBuildCommand\":\"\",\"beforeDevCommand\":\"\"}}"
+          args: --config tauri.conf.ci.json
           tagName: build-${{ github.run_number }}
           releaseName: "Build #${{ github.run_number }}"
           releaseBody: |
