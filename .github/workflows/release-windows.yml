@@ -66,6 +66,14 @@ jobs:
         working-directory: ui
         run: npm run build
 
+      - name: Build aion2-proxy (Windows)
+        run: cargo build --release -p aion2-proxy
+
+      - name: Copy proxy binary to binaries
+        run: |
+          New-Item -ItemType Directory -Force -Path crates/aion2-app/binaries | Out-Null
+          Copy-Item target/release/aion2-proxy.exe crates/aion2-app/binaries/aion2-proxy.exe -Force
+
       - name: Download relay binary
         uses: actions/download-artifact@v4
         with:

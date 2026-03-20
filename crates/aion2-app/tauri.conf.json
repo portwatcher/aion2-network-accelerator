@@ -11,7 +11,7 @@
       "cwd": "../.."
     },
     "beforeBuildCommand": {
-      "script": "cargo build -p aion2-relay -p aion2-proxy --release && mkdir crates\\aion2-app\\binaries 2>nul & copy /Y target\\release\\aion2-relay.exe crates\\aion2-app\\binaries\\aion2-relay >nul & copy /Y target\\release\\aion2-proxy.exe crates\\aion2-app\\binaries\\aion2-proxy >nul && cd ui && npm run build",
+      "script": "cargo build -p aion2-relay -p aion2-proxy --release && mkdir crates\\aion2-app\\binaries 2>nul & copy /Y target\\release\\aion2-relay.exe crates\\aion2-app\\binaries\\aion2-relay >nul & copy /Y target\\release\\aion2-proxy.exe crates\\aion2-app\\binaries\\aion2-proxy.exe >nul && cd ui && npm run build",
       "cwd": "../.."
     }
   },
@@ -46,7 +46,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["binaries/aion2-relay", "binaries/aion2-proxy", "binaries/wintun.dll"],
+    "resources": ["binaries/aion2-relay", "binaries/aion2-proxy.exe", "binaries/wintun.dll"],
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
