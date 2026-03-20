@@ -40,7 +40,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [],
+    "resources": ["binaries/aion2-relay"],
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
