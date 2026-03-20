@@ -14,8 +14,6 @@ struct TcpConn {
     tx: mpsc::Sender<Vec<u8>>,
     /// Send shutdown signal.
     shutdown_tx: mpsc::Sender<()>,
-    /// Which user owns this connection (for routing responses).
-    key_id: KeyId,
 }
 
 /// Per-user state.
@@ -276,7 +274,7 @@ async fn handle_connect(state: Arc<RelayState>, conn: ConnId, key_id: KeyId) -> 
     // Register the connection
     {
         let mut conns = state.conns.write().await;
-        conns.insert(conn, TcpConn { tx: data_tx, shutdown_tx, key_id });
+        conns.insert(conn, TcpConn { tx: data_tx, shutdown_tx });
     }
 
     // Task: tunnel → TCP (write to game server)

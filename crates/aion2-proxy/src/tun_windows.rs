@@ -57,7 +57,6 @@ struct NatEntry {
 enum NatState {
     SynReceived,
     Established,
-    Closing,
 }
 
 #[cfg(windows)]
@@ -281,7 +280,6 @@ async fn handle_tun_packet(
 
                 if fin {
                     entry.client_next_seq = entry.client_next_seq.wrapping_add(1);
-                    entry.state = NatState::Closing;
 
                     fin_ack_pkt = Some(build_tcp_packet(
                         entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
@@ -295,6 +293,10 @@ async fn handle_tun_packet(
                     entry.our_next_seq = entry.our_next_seq.wrapping_add(1);
                     do_shutdown = true;
                 }
+            }
+            // Remove entry on FIN — connection is done.
+            if fin {
+                table.remove(&conn);
             }
         } // lock released
 
@@ -375,7 +377,7 @@ async fn handle_relay_event(
 
         RelayEvent::Shutdown(conn) => {
             let mut table = nat_table.lock().await;
-            if let Some(entry) = table.get_mut(&conn) {
+            if let Some(entry) = table.remove(&conn) {
                 let fin = build_tcp_packet(
                     entry.dst_ip, entry.src_ip, entry.dst_port, entry.src_port,
                     entry.our_next_seq,
@@ -385,8 +387,7 @@ async fn handle_relay_event(
                     &[],
                     false,
                 );
-                entry.our_next_seq = entry.our_next_seq.wrapping_add(1);
-                entry.state = NatState::Closing;
+                drop(table);
                 let _ = tun_write_tx.send(fin).await;
                 tracing::debug!(%conn, "relay shutdown, sent FIN to OS");
             }
