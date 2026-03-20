@@ -1,0 +1,51 @@
+name: Release Windows Build
+
+on:
+  push:
+    branches: ["*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "crates/aion2-app -> ../../target"
+
+      - name: Install frontend dependencies
+        working-directory: ui
+        run: npm install
+
+      - name: Build frontend
+        working-directory: ui
+        run: npm run build
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: crates/aion2-app
+          tauriScript: npx tauri
+          tagName: build-${{ github.run_number }}
+          releaseName: "Build #${{ github.run_number }}"
+          releaseBody: |
+            Automated Windows build from `${{ github.sha }}`.
+            Branch: `${{ github.ref_name }}`
+          releaseDraft: false
+          prerelease: true
