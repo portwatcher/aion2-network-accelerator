@@ -259,13 +259,15 @@ fn deploy_relay_impl(app: &AppHandle, config: DeployConfig) -> Result<DeployResu
         needs_restart = true;
     }
 
-    // 7. Open firewall
+    // 7. Open firewall (UDP + TCP)
     emit_progress(app, "Configuring firewall...");
     let _ = ssh_exec(
         &session,
-        "command -v ufw >/dev/null 2>&1 && ufw allow 443/udp 2>/dev/null; \
+        "command -v ufw >/dev/null 2>&1 && ufw allow 443/udp 2>/dev/null && ufw allow 443/tcp 2>/dev/null; \
          iptables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || \
-         iptables -A INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null; true",
+         iptables -A INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null; \
+         iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || \
+         iptables -A INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null; true",
     );
 
     // 8. Enable and (re)start service only if something changed
