@@ -94,6 +94,9 @@ pub async fn run_tun(
 
     let nat_table: NatTable = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
+    // Channel: constructed packets → TUN write thread
+    let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Vec<u8>>(512);
+
     // Channel: TUN read thread → main loop
     let (tun_read_tx, mut tun_read_rx) = mpsc::channel::<Vec<u8>>(512);
 
@@ -124,15 +127,30 @@ pub async fn run_tun(
         }
     });
 
-    // Main event loop: process TUN packets and relay events.
-    // TUN writes go directly to the wintun session (no intermediate channel).
+    // Thread: write constructed packets into TUN adapter
+    let write_session = session.clone();
+    std::thread::spawn(move || {
+        while let Some(data) = tun_write_rx.blocking_recv() {
+            match write_session.allocate_send_packet(data.len() as u16) {
+                Ok(mut pkt) => {
+                    pkt.bytes_mut().copy_from_slice(&data);
+                    write_session.send_packet(pkt);
+                }
+                Err(e) => {
+                    tracing::warn!("wintun write alloc failed: {e}");
+                }
+            }
+        }
+    });
+
+    // Main event loop: process TUN packets and relay events
     loop {
         tokio::select! {
             Some(packet) = tun_read_rx.recv() => {
-                handle_tun_packet(&state, &nat_table, &session, &packet).await;
+                handle_tun_packet(&state, &nat_table, &tun_write_tx, &packet).await;
             }
             Some(event) = relay_rx.recv() => {
-                handle_relay_event(&state, &nat_table, &session, event).await;
+                handle_relay_event(&state, &nat_table, &tun_write_tx, event).await;
             }
             else => break,
         }
@@ -141,28 +159,12 @@ pub async fn run_tun(
     Ok(())
 }
 
-// ── Write a packet directly to the wintun session (non-blocking ring buffer) ─
-#[cfg(windows)]
-#[inline]
-fn tun_send(session: &Arc<wintun::Session>, data: &[u8]) {
-    let session = Arc::clone(session);
-    match session.allocate_send_packet(data.len() as u16) {
-        Ok(mut pkt) => {
-            pkt.bytes_mut().copy_from_slice(data);
-            session.send_packet(pkt);
-        }
-        Err(e) => {
-            tracing::warn!(len = data.len(), "wintun write alloc failed: {e}");
-        }
-    }
-}
-
 // ── Process a raw IP packet coming from the OS via TUN ───────────────────────
 #[cfg(windows)]
 async fn handle_tun_packet(
     state: &Arc<TunnelState>,
     nat_table: &NatTable,
-    session: &Arc<wintun::Session>,
+    tun_write_tx: &mpsc::Sender<Vec<u8>>,
     ip_packet: &[u8],
 ) {
     // Must be IPv4 with at least a minimal header
@@ -230,7 +232,7 @@ async fn handle_tun_packet(
             &[],
             true, // include MSS option
         );
-        tun_send(session, &syn_ack);
+        let _ = tun_write_tx.send(syn_ack).await;
 
         // Ask the relay to open a real TCP connection to the destination
         let _ = tunnel::open_connection(state, src_ip, src_port, dst_ip, dst_port).await;
@@ -297,13 +299,13 @@ async fn handle_tun_packet(
         } // lock released
 
         if let Some(pkt) = ack_pkt {
-            tun_send(session, &pkt);
+            let _ = tun_write_tx.send(pkt).await;
         }
         if let Some(data) = data_to_send {
             let _ = tunnel::send_data(state, conn, data).await;
         }
         if let Some(pkt) = fin_ack_pkt {
-            tun_send(session, &pkt);
+            let _ = tun_write_tx.send(pkt).await;
         }
         if do_shutdown {
             let _ = tunnel::send_shutdown(state, conn).await;
@@ -316,7 +318,7 @@ async fn handle_tun_packet(
 async fn handle_relay_event(
     state: &Arc<TunnelState>,
     nat_table: &NatTable,
-    session: &Arc<wintun::Session>,
+    tun_write_tx: &mpsc::Sender<Vec<u8>>,
     event: RelayEvent,
 ) {
     match event {
@@ -346,7 +348,7 @@ async fn handle_relay_event(
                     &[],
                     false,
                 );
-                tun_send(session, &rst);
+                let _ = tun_write_tx.send(rst).await;
                 tracing::warn!(%conn, %reason, "tunnel connect failed, sent RST");
             }
         }
@@ -366,7 +368,7 @@ async fn handle_relay_event(
                         false,
                     );
                     entry.our_next_seq = entry.our_next_seq.wrapping_add(chunk.len() as u32);
-                    tun_send(session, &data_pkt);
+                    let _ = tun_write_tx.send(data_pkt).await;
                 }
             }
         }
@@ -385,7 +387,7 @@ async fn handle_relay_event(
                 );
                 entry.our_next_seq = entry.our_next_seq.wrapping_add(1);
                 entry.state = NatState::Closing;
-                tun_send(session, &fin);
+                let _ = tun_write_tx.send(fin).await;
                 tracing::debug!(%conn, "relay shutdown, sent FIN to OS");
             }
         }
@@ -402,7 +404,7 @@ async fn handle_relay_event(
                     &[],
                     false,
                 );
-                tun_send(session, &rst);
+                let _ = tun_write_tx.send(rst).await;
             }
         }
     }
