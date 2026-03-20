@@ -13,8 +13,34 @@ permissions:
   contents: write
 
 jobs:
+  build-relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Build aion2-relay (musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p aion2-relay
+
+      - name: Upload relay binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: aion2-relay-linux
+          path: target/x86_64-unknown-linux-musl/release/aion2-relay
+
   build-windows:
     runs-on: windows-latest
+    needs: build-relay
 
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +65,12 @@ jobs:
       - name: Build frontend
         working-directory: ui
         run: npm run build
+
+      - name: Download relay binary
+        uses: actions/download-artifact@v4
+        with:
+          name: aion2-relay-linux
+          path: crates/aion2-app/binaries
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0

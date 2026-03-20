@@ -5,7 +5,7 @@ use ssh2::Session;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Debug, Deserialize)]
 pub struct DeployConfig {
@@ -49,7 +49,16 @@ fn emit_progress(app: &AppHandle, msg: impl Into<String>) {
     let _ = app.emit("deploy-progress", &msg);
 }
 
-fn find_relay_binary() -> Result<Vec<u8>, String> {
+fn find_relay_binary(app: &AppHandle) -> Result<Vec<u8>, String> {
+    // Try bundled resource (distributed app)
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let bundled = resource_dir.join("binaries/aion2-relay");
+        if let Ok(data) = std::fs::read(&bundled) {
+            return Ok(data);
+        }
+    }
+
+    // Fallback: dev workspace path
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -169,7 +178,7 @@ fn deploy_relay_impl(app: &AppHandle, config: DeployConfig) -> Result<DeployResu
 
     // 1. Read the pre-compiled musl binary
     emit_progress(app, "Reading relay binary...");
-    let binary = find_relay_binary()?;
+    let binary = find_relay_binary(app)?;
     emit_progress(app, format!("Binary loaded ({} bytes)", binary.len()));
 
     // 2. Connect via SSH
