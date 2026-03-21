@@ -7,11 +7,11 @@
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": {
-      "script": "cargo build -p aion2-relay -p aion2-proxy && mkdir crates\\aion2-app\\binaries 2>nul & copy /Y target\\debug\\aion2-relay.exe crates\\aion2-app\\binaries\\aion2-relay >nul && cd ui && npm run dev",
+      "script": "cargo build -p aion2-proxy && cargo build -p aion2-relay --release --target x86_64-unknown-linux-musl && mkdir crates\\aion2-app\\binaries 2>nul & copy /Y target\\x86_64-unknown-linux-musl\\release\\aion2-relay crates\\aion2-app\\binaries\\aion2-relay >nul && cd ui && npm run dev",
       "cwd": "../.."
     },
     "beforeBuildCommand": {
-      "script": "cargo build -p aion2-relay -p aion2-proxy --release && mkdir crates\\aion2-app\\binaries 2>nul & copy /Y target\\release\\aion2-relay.exe crates\\aion2-app\\binaries\\aion2-relay >nul & copy /Y target\\release\\aion2-proxy.exe crates\\aion2-app\\binaries\\aion2-proxy.exe >nul && cd ui && npm run build",
+      "script": "cargo build -p aion2-proxy --release && cargo build -p aion2-relay --release --target x86_64-unknown-linux-musl && mkdir crates\\aion2-app\\binaries 2>nul & copy /Y target\\x86_64-unknown-linux-musl\\release\\aion2-relay crates\\aion2-app\\binaries\\aion2-relay >nul & copy /Y target\\release\\aion2-proxy.exe crates\\aion2-app\\binaries\\aion2-proxy.exe >nul && cd ui && npm run build",
       "cwd": "../.."
     }
   },
